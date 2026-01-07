@@ -1,0 +1,9 @@
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('stock/<str:stock_code>/', views.get_stock_realtime_data, name='get_stock_realtime_data'),
+    path('trade-records/<str:stock_code>/', views.trade_records, name='trade_records'),
+    path('trade-setting/', views.update_trade_setting, name='update_trade_setting'),
+    path('account/', views.update_account, name='update_account'),
+]
