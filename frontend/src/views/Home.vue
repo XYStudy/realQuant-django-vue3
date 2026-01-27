@@ -71,6 +71,55 @@
 
           <el-row :gutter="20">
             <el-col :span="24">
+              <el-form-item label="行情阶段" required>
+                <el-radio-group v-model="tradeSettings.marketStage">
+                  <el-radio label="oscillation">震荡阶段</el-radio>
+                  <el-radio label="downward">下跌阶段</el-radio>
+                  <el-radio label="upward">上涨阶段</el-radio>
+                </el-radio-group>
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="20" v-if="tradeSettings.marketStage">
+            <el-col :span="24">
+              <el-form-item label="交易策略">
+                <el-select v-model="tradeSettings.strategy" placeholder="请选择策略" style="width: 300px">
+                  <el-option label="格子法做T" value="grid" v-if="tradeSettings.marketStage === 'oscillation'" />
+                  <el-option label="百分比做T" value="percentage" v-if="tradeSettings.marketStage === 'oscillation'" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="20" v-if="tradeSettings.marketStage === 'oscillation' && tradeSettings.strategy === 'percentage'">
+            <el-col :span="24">
+              <el-form-item label="高于均价卖出(%)">
+                <el-input-number v-model="tradeSettings.sellThreshold" :min="0" :max="10" :step="0.1" style="width: 300px" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="24">
+              <el-form-item label="低于均价买入(%)">
+                <el-input-number v-model="tradeSettings.buyThreshold" :min="0" :max="10" :step="0.1" style="width: 300px" />
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="20" v-if="tradeSettings.marketStage === 'oscillation' && tradeSettings.strategy === 'grid'">
+            <el-col :span="24">
+              <el-form-item label-width="150px" label="高于均价格子数卖出">
+                <el-input-number v-model="tradeSettings.gridSellCount" :min="1" :max="100" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="24">
+              <el-form-item label-width="150px" label="低于均价格子数买入">
+                <el-input-number v-model="tradeSettings.gridBuyCount" :min="1" :max="100" style="width: 300px" />
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="20">
+            <el-col :span="24">
               <el-form-item label="买入金额(元)">
                 <el-input-number v-model="tradeSettings.buyAmount" :min="1000" :max="1000000" :step="1000" style="width: 300px" />
               </el-form-item>
@@ -101,21 +150,8 @@
             </el-col>
           </el-row>
 
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item label="高于均价卖出(%)">
-                <el-input-number v-model="tradeSettings.sellThreshold" :min="0" :max="10" :step="0.1" style="width: 300px" />
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="低于均价买入(%)">
-                <el-input-number v-model="tradeSettings.buyThreshold" :min="0" :max="10" :step="0.1" style="width: 300px" />
-              </el-form-item>
-            </el-col>
-          </el-row>
-
           <div class="form-actions">
-            <el-button type="primary" @click="startMonitoring">开始监控</el-button>
+            <el-button type="primary" @click="startMonitoring" :disabled="!tradeSettings.marketStage">开始监控</el-button>
             <el-button @click="stopMonitoring">停止监控</el-button>
           </div>
         </el-form>
@@ -193,28 +229,101 @@
         </div>
       </el-card>
 
-      <el-card class="mt-10">
-        <template #header>
-          <div class="card-header">
-            <span>交易记录</span>
-            <el-button type="danger" size="small" @click="showClearDialog">清空数据</el-button>
-          </div>
-        </template>
-        <el-table :data="tradeRecords" style="width: 100%">
-          <el-table-column prop="timestamp" label="时间" width="180" />
-          <el-table-column prop="trade_type" label="类型" width="100">
-            <template #default="scope">
-              <el-tag :type="scope.row.trade_type === 'buy' ? 'success' : 'danger'">
-                {{ scope.row.trade_type === 'buy' ? '买入' : '卖出' }}
-              </el-tag>
+      <el-tabs v-model="activeTab" class="mt-10 trade-tabs">
+        <el-tab-pane label="闭环交易" name="loops">
+          <el-card>
+            <!-- 当前挂起状态 -->
+            <div v-if="pendingLoop.type" class="pending-status mb-10">
+              <el-alert
+                :title="'当前状态: ' + (pendingLoop.type === 'buy_first' ? '已买入，等待卖出闭环' : '已卖出，等待买入闭环')"
+                type="info"
+                :closable="false"
+                show-icon
+              >
+                <template #default>
+                  <div class="mt-5">
+                    <span class="mr-10">挂起价格: {{ pendingLoop.price }}</span>
+                    <span class="mr-10">挂起数量: {{ pendingLoop.volume }}</span>
+                    <span>挂起时间: {{ pendingLoop.timestamp }}</span>
+                  </div>
+                  <div class="mt-10 flex-align-center">
+                    <span class="mr-10">隔夜{{ pendingLoop.type === 'buy_first' ? '卖出' : '买入' }}比例 (%):</span>
+                    <el-input-number 
+                      v-model="pendingLoop.overnightRatio" 
+                      :min="0" 
+                      :max="100" 
+                      :step="0.1" 
+                      size="small"
+                      style="width: 120px"
+                    />
+                    <el-button type="primary" size="small" class="ml-10" @click="saveOvernightRatio">
+                      保存隔夜比例
+                    </el-button>
+                  </div>
+                </template>
+              </el-alert>
+            </div>
+
+            <el-table :data="tradeLoops" style="width: 100%">
+              <el-table-column prop="loop_type_display" label="闭环类型" width="120" />
+              <el-table-column label="开仓" width="220">
+                <template #default="scope">
+                  <div>价格: {{ scope.row.open_price }}</div>
+                  <div class="text-gray text-small">时间: {{ scope.row.open_time }}</div>
+                </template>
+              </el-table-column>
+              <el-table-column label="平仓" width="220">
+                <template #default="scope">
+                  <div v-if="scope.row.is_closed">
+                    <div>价格: {{ scope.row.close_price }}</div>
+                    <div class="text-gray text-small">时间: {{ scope.row.close_time }}</div>
+                  </div>
+                  <el-tag v-else type="info">进行中</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="profit" label="盈亏" width="100">
+                <template #default="scope">
+                  <span :class="scope.row.profit > 0 ? 'price-up' : (scope.row.profit < 0 ? 'price-down' : '')">
+                    {{ scope.row.profit }}
+                  </span>
+                </template>
+              </el-table-column>
+              <el-table-column label="状态">
+                <template #default="scope">
+                  <el-tag :type="scope.row.is_closed ? 'success' : 'warning'">
+                    {{ scope.row.is_closed ? '已闭环' : '未闭环' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+            </el-table>
+          </el-card>
+        </el-tab-pane>
+
+        <el-tab-pane label="交易记录" name="records">
+          <el-card>
+            <template #header>
+              <div class="card-header">
+                <span>历史记录</span>
+                <el-button type="danger" size="small" @click="showClearDialog">清空数据</el-button>
+              </div>
             </template>
-          </el-table-column>
-          <el-table-column prop="price" label="价格" width="100" />
-          <el-table-column prop="volume" label="数量" width="100" />
-          <el-table-column prop="amount" label="金额" width="120" />
-          <el-table-column prop="reason" label="原因" />
-        </el-table>
-      </el-card>
+            <el-table :data="tradeRecords" style="width: 100%">
+              <el-table-column prop="timestamp" label="时间" width="180" />
+              <el-table-column prop="trade_type" label="类型" width="100">
+                <template #default="scope">
+                  <el-tag :type="scope.row.trade_type === 'buy' ? 'success' : 'danger'">
+                    {{ scope.row.trade_type === 'buy' ? '买入' : '卖出' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="price" label="价格" width="100" />
+              <el-table-column prop="volume" label="数量" width="100" />
+              <el-table-column prop="amount" label="金额" width="120" />
+              <el-table-column prop="reason" label="原因" />
+            </el-table>
+          </el-card>
+        </el-tab-pane>
+      </el-tabs>
     </div>
   </div>
 </template>
@@ -235,6 +344,10 @@ const tradeSettings = reactive({
   sellShares: null,
   sellThreshold: 0.5,
   buyThreshold: 0.5,
+  marketStage: '', // 'oscillation', 'downward', 'upward'
+  strategy: 'grid', // 'grid', 'percentage'
+  gridBuyCount: 1,
+  gridSellCount: 1,
 });
 
 const realtimeData = reactive({
@@ -246,6 +359,15 @@ const realtimeData = reactive({
 });
 
 const tradeRecords = ref([]);
+const tradeLoops = ref([]);
+const activeTab = ref('loops');
+const pendingLoop = reactive({
+  type: null,
+  price: null,
+  volume: null,
+  timestamp: null,
+  overnightRatio: 0
+});
 const clearDialogVisible = ref(false);
 const monitoringTimer = ref(null);
 const accountSettings = reactive({
@@ -367,6 +489,7 @@ const fetchStockData = async () => {
 
     // 获取最新的交易记录
     await fetchTradeRecords();
+    await fetchTradeLoops();
   } catch (error) {
     console.error('获取股票数据失败:', error);
   }
@@ -374,14 +497,26 @@ const fetchStockData = async () => {
 
 // 从后端获取交易记录
 const fetchTradeRecords = async () => {
+  if (!tradeSettings.stockCode || tradeSettings.stockCode.length !== 6) return;
   try {
-    const response = await axios.get(`/api/trade-records/${tradeSettings.stockCode}`);
+    const response = await axios.get(`/api/trade-records/${tradeSettings.stockCode}/`);
     tradeRecords.value = response.data;
 
     // 计算盈利
     calculateProfit(response.data);
   } catch (error) {
     console.error('获取交易记录失败:', error);
+  }
+};
+
+// 从后端获取闭环交易记录
+const fetchTradeLoops = async () => {
+  if (!tradeSettings.stockCode || tradeSettings.stockCode.length !== 6) return;
+  try {
+    const response = await axios.get(`/api/trade-loops/${tradeSettings.stockCode}/`);
+    tradeLoops.value = response.data;
+  } catch (error) {
+    console.error('获取闭环交易记录失败:', error);
   }
 };
 
@@ -479,6 +614,10 @@ const connectWebSocket = async () => {
       buy_shares: tradeSettings.buyShares,
       sell_shares: tradeSettings.sellShares,
       update_interval: tradeSettings.updateInterval,
+      market_stage: tradeSettings.marketStage,
+      strategy: tradeSettings.strategy,
+      grid_buy_count: tradeSettings.gridBuyCount,
+      grid_sell_count: tradeSettings.gridSellCount,
     });
 
     // 确保stockCode是字符串类型
@@ -574,8 +713,8 @@ const handleWebSocketMessage = (message) => {
       realtimeData.currentPrice = message.stock_data.current_price;
       realtimeData.averagePrice = message.stock_data.average_price;
       realtimeData.priceDiff = message.stock_data.price_diff_percent;
-      realtimeData.highPrice = message.stock_data.high_price || message.stock_data.current_price;
-      realtimeData.lowPrice = message.stock_data.low_price || message.stock_data.current_price;
+      realtimeData.highPrice = message.stock_data.high || message.stock_data.current_price;
+      realtimeData.lowPrice = message.stock_data.low || message.stock_data.current_price;
       
       // 更新账户信息
       if (message.account) {
@@ -588,6 +727,25 @@ const handleWebSocketMessage = (message) => {
       if (message.trade_records) {
         tradeRecords.value = message.trade_records;
         calculateProfit(message.trade_records);
+      }
+      
+      // 更新闭环交易数据
+      if (message.trade_loops) {
+        tradeLoops.value = message.trade_loops;
+      }
+      
+      // 更新挂起状态
+      if (message.trade_setting) {
+        pendingLoop.type = message.trade_setting.pending_loop_type;
+        pendingLoop.price = message.trade_setting.pending_price;
+        pendingLoop.volume = message.trade_setting.pending_volume;
+        pendingLoop.timestamp = message.trade_setting.pending_timestamp;
+        
+        if (pendingLoop.type === 'buy_first') {
+          pendingLoop.overnightRatio = message.trade_setting.overnight_sell_ratio;
+        } else if (pendingLoop.type === 'sell_first') {
+          pendingLoop.overnightRatio = message.trade_setting.overnight_buy_ratio;
+        }
       }
       
       // 更新图表数据
@@ -664,6 +822,26 @@ const saveAccountSettings = async () => {
   }
 };
 
+// 保存隔夜比例
+const saveOvernightRatio = async () => {
+  try {
+    const data = {
+      stock_code: tradeSettings.stockCode,
+    };
+    if (pendingLoop.type === 'buy_first') {
+      data.overnight_sell_ratio = pendingLoop.overnightRatio;
+    } else if (pendingLoop.type === 'sell_first') {
+      data.overnight_buy_ratio = pendingLoop.overnightRatio;
+    }
+    
+    await axios.post('/api/trade-setting/', data);
+    ElMessage.success('隔夜比例保存成功');
+  } catch (error) {
+    console.error('保存隔夜比例失败:', error);
+    ElMessage.error('保存隔夜比例失败');
+  }
+};
+
 // 显示清空数据弹窗
 const showClearDialog = () => {
   clearDialogVisible.value = true;
@@ -682,6 +860,7 @@ const clearTradeRecords = async () => {
 
     // 清空前端交易记录
     tradeRecords.value = [];
+    tradeLoops.value = [];
 
     // 清空盈利信息
     profitInfo.value = {
@@ -702,7 +881,23 @@ const clearTradeRecords = async () => {
   }
 };
 
+// 监听股票代码变化，当长度为6位时自动加载数据
+watch(
+  () => tradeSettings.stockCode,
+  (newVal) => {
+    if (newVal && newVal.length === 6) {
+      fetchTradeRecords();
+      fetchTradeLoops();
+    }
+  }
+);
+
 onMounted(() => {
+  // 页面加载时，如果已有6位代码，则加载数据
+  if (tradeSettings.stockCode && tradeSettings.stockCode.length === 6) {
+    fetchTradeRecords();
+    fetchTradeLoops();
+  }
 });
 
 onUnmounted(() => {
@@ -714,7 +909,6 @@ onUnmounted(() => {
 .home-container {
   display: flex;
   gap: 20px;
-  padding: 20px;
   max-width: 1600px;
   margin: 0 auto;
 }
@@ -780,6 +974,42 @@ onUnmounted(() => {
 
 .mt-20 {
   margin-top: 20px;
+}
+
+.mb-10 {
+  margin-bottom: 10px;
+}
+
+.ml-10 {
+  margin-left: 10px;
+}
+
+.mr-10 {
+  margin-right: 10px;
+}
+
+.flex-align-center {
+  display: flex;
+  align-items: center;
+}
+
+.text-gray {
+  color: #909399;
+}
+
+.text-small {
+  font-size: 0.85rem;
+}
+
+.trade-tabs :deep(.el-tabs__content) {
+  padding: 0;
+}
+
+.trade-tabs :deep(.el-tabs__header) {
+  margin-bottom: 0;
+  background: #fff;
+  padding: 0 20px;
+  border-radius: 4px 4px 0 0;
 }
 
 .data-source-info {

@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from django.utils import timezone
 from decimal import Decimal
 
-from .models import StockData, TradeRecord, TradeSetting, Account
+from .models import StockData, TradeRecord, TradeSetting, Account, TradeLoop
 from .services.stock_service import StockDataService
 
 class StockDataViewSet(viewsets.ReadOnlyModelViewSet):
@@ -44,6 +44,12 @@ def get_stock_realtime_data(request, stock_code):
     try:
         # 获取股票数据
         stock_data = StockDataService.get_stock_data(stock_code)
+        
+        if stock_data is None:
+            return Response(
+                {"error": "获取股票数据失败", "message": f"无法获取股票 {stock_code} 的数据"},
+                status=status.HTTP_404_NOT_FOUND
+            )
         
         # 保存到数据库
         stock_data_model = StockData(
@@ -89,8 +95,7 @@ def get_stock_realtime_data(request, stock_code):
             # 检查交易条件
             should_trade, trade_type, reason = StockDataService.check_trade_condition(
                 stock_data, 
-                setting.sell_threshold, 
-                setting.buy_threshold
+                setting
             )
             
             if should_trade:
@@ -105,9 +110,9 @@ def get_stock_realtime_data(request, stock_code):
                         trade_volume = setting.buy_shares
                     else:
                         # 使用买入金额
-                        buy_amount = setting.buy_amount or Decimal('10000')
+                        _temp_buy_amount = setting.buy_amount or Decimal('10000')
                         # 计算交易数量，向下取整到100股的倍数
-                        trade_volume = int(buy_amount / stock_data['current_price'] / Decimal('100')) * 100
+                        trade_volume = int(_temp_buy_amount / stock_data['current_price'] / Decimal('100')) * 100
                     
                     # 确保是100股的倍数且至少100股
                     trade_volume = max(100, (trade_volume // 100) * 100)
@@ -142,9 +147,9 @@ def get_stock_realtime_data(request, stock_code):
                         trade_volume = setting.sell_shares
                     else:
                         # 使用卖出金额
-                        sell_amount = setting.sell_amount or Decimal('10000')
+                        _temp_sell_amount = setting.sell_amount or Decimal('10000')
                         # 计算交易数量，向下取整到100股的倍数
-                        trade_volume = int(sell_amount / stock_data['current_price'] / Decimal('100')) * 100
+                        trade_volume = int(_temp_sell_amount / stock_data['current_price'] / Decimal('100')) * 100
                     
                     # 确保是100股的倍数且至少100股
                     trade_volume = max(100, (trade_volume // 100) * 100)
@@ -178,7 +183,7 @@ def get_stock_realtime_data(request, stock_code):
             'volume': stock_data['volume'],
             'price_diff': stock_data['price_diff'],
             'price_diff_percent': stock_data['price_diff_percent'],
-            'timestamp': stock_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+            'timestamp': stock_data['timestamp'],
             'account': {
                 'balance': float(account.balance),
                 'shares': account.shares,
@@ -225,14 +230,54 @@ def trade_records(request, stock_code):
         elif request.method == 'DELETE':
             # 清空交易记录
             TradeRecord.objects.filter(stock_code=stock_code).delete()
+            # 同时清空关联的闭环记录
+            TradeLoop.objects.filter(stock_code=stock_code).delete()
             
             return Response({
-                'message': '交易记录已成功清空'
+                'message': '交易记录及闭环交易已成功清空'
             })
     except Exception as e:
         return Response({
             'error': str(e),
             'message': f'{"获取交易记录失败" if request.method == "GET" else "清空交易记录失败"}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def trade_loops(request, stock_code):
+    """
+    获取股票闭环交易记录
+    
+    Args:
+        request: HTTP请求
+        stock_code: 股票代码
+        
+    Returns:
+        Response: 闭环交易记录列表
+    """
+    try:
+        # 获取闭环交易记录
+        loops = TradeLoop.objects.filter(stock_code=stock_code).order_by('-created_at')[:50]
+        
+        result = []
+        for loop in loops:
+            result.append({
+                'id': loop.id,
+                'stock_code': loop.stock_code,
+                'loop_type': loop.loop_type,
+                'loop_type_display': loop.get_loop_type_display(),
+                'open_price': float(loop.open_record.price),
+                'open_time': loop.open_record.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                'close_price': float(loop.close_record.price) if loop.close_record else None,
+                'close_time': loop.close_record.timestamp.strftime('%Y-%m-%d %H:%M:%S') if loop.close_record else None,
+                'is_closed': loop.is_closed,
+                'profit': float(loop.profit)
+            })
+        
+        return Response(result)
+    except Exception as e:
+        return Response({
+            'error': str(e),
+            'message': '获取闭环交易记录失败'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['POST'])
@@ -273,6 +318,10 @@ def update_trade_setting(request):
                 'buy_shares': buy_shares,
                 'sell_shares': sell_shares,
                 'update_interval': data.get('update_interval', 5),
+                'market_stage': data.get('market_stage'),
+                'strategy': data.get('strategy', 'grid'),
+                'grid_buy_count': data.get('grid_buy_count', 1),
+                'grid_sell_count': data.get('grid_sell_count', 1),
                 'is_active': True
             }
         )
@@ -286,6 +335,10 @@ def update_trade_setting(request):
             trade_setting.buy_shares = buy_shares
             trade_setting.sell_shares = sell_shares
             trade_setting.update_interval = data.get('update_interval', trade_setting.update_interval)
+            trade_setting.market_stage = data.get('market_stage', trade_setting.market_stage)
+            trade_setting.strategy = data.get('strategy', trade_setting.strategy)
+            trade_setting.grid_buy_count = data.get('grid_buy_count', trade_setting.grid_buy_count)
+            trade_setting.grid_sell_count = data.get('grid_sell_count', trade_setting.grid_sell_count)
             trade_setting.is_active = True
             trade_setting.save()
         
@@ -300,6 +353,10 @@ def update_trade_setting(request):
                 'buy_shares': trade_setting.buy_shares,
                 'sell_shares': trade_setting.sell_shares,
                 'update_interval': trade_setting.update_interval,
+                'market_stage': trade_setting.market_stage,
+                'strategy': trade_setting.strategy,
+                'grid_buy_count': trade_setting.grid_buy_count,
+                'grid_sell_count': trade_setting.grid_sell_count,
                 'is_active': trade_setting.is_active
             }
         })

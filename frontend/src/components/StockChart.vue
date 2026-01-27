@@ -147,6 +147,29 @@ const initChart = () => {
   emit('chart-ready', chartInstance);
 };
 
+// 动态更新格子的步长算法
+const getGridStep = (high, low) => {
+  const range = high - low;
+  if (range <= 0) return 0.01;
+
+  // 尝试不同格子数（6～8），选最合适的 nice step
+  const candidates = [];
+  for (let n = 6; n <= 8; n++) {
+    const step = range / n;
+    candidates.push(step);
+  }
+  const ideal = Math.min(...candidates); // 取最小步长（最多格子）
+
+  // 美化序列（包含0.06）
+  const nice = [0.01, 0.02, 0.05, 0.06, 0.08, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10];
+  for (let v of nice) {
+    if (v >= ideal * 0.9) { // 允许90%容差
+      return v;
+    }
+  }
+  return ideal;
+};
+
 // 更新图表
 const updateChart = () => {
   // 计算Y轴范围，使用专业股票软件的刻度间距算法
@@ -167,45 +190,13 @@ const updateChart = () => {
     pMin -= range;
   }
   
-  // 步骤1：确定显示范围（加缓冲）
-  // 为避免价格贴边，上下各扩展0.1元
-  const expandAmount = 0.1;
-  const expandedMax = pMax + expandAmount;
-  const expandedMin = pMin - expandAmount;
-  const displayRange = expandedMax - expandedMin;
+  // 使用新的步长算法
+  const niceInterval = getGridStep(pMax, pMin);
   
-  // 步骤2：预设目标区间数（5个网格区间）
-  const targetIntervals = 5;
-  const initialInterval = (expandedMax - expandedMin) / targetIntervals;
-  
-  // 步骤3：将间距规整化到"友好数"
-  // 严格按照文档中的规则进行规整化
-  let niceInterval;
-  
-  if (initialInterval < 0.01) {
-    // 原始间距 < 0.01，规整到 {0.001, 0.002, 0.005}
-    niceInterval = [0.001, 0.002, 0.005].find(i => i >= initialInterval) || 0.005;
-  } else if (initialInterval < 0.1) {
-    // 原始间距 0.01 ～ 0.1，规整到 {0.01, 0.02, 0.05}
-    niceInterval = [0.01, 0.02, 0.05].find(i => i >= initialInterval) || 0.05;
-  } else if (initialInterval < 1) {
-    // 原始间距 0.1 ～ 1，规整到 {0.1, 0.2, 0.25, 0.5}
-    niceInterval = [0.1, 0.2, 0.25, 0.5].find(i => i >= initialInterval) || 0.5;
-  } else if (initialInterval < 10) {
-    // 原始间距 1 ～ 10，规整到 {1, 2, 2.5, 5}
-    niceInterval = [1, 2, 2.5, 5].find(i => i >= initialInterval) || 5;
-  } else if (initialInterval < 100) {
-    // 原始间距 10 ～ 100，规整到 {10, 20, 25, 50}
-    niceInterval = [10, 20, 25, 50].find(i => i >= initialInterval) || 50;
-  } else {
-    // 原始间距 >= 100，规整到 {10, 20, 50, 100}
-    niceInterval = [10, 20, 50, 100].find(i => i >= initialInterval) || 100;
-  }
-  
-  // 步骤4：重新计算坐标轴范围
-  // 以niceInterval为间距，找到能覆盖[expandedMin, expandedMax]的最小整数倍范围
-  const yMin = Math.floor(expandedMin / niceInterval) * niceInterval;
-  const yMax = Math.ceil(expandedMax / niceInterval) * niceInterval;
+  // 重新计算坐标轴范围
+  // 以niceInterval为间距，找到能覆盖[pMin, pMax]的最小整数倍范围
+  const yMin = Math.floor(pMin / niceInterval) * niceInterval;
+  const yMax = Math.ceil(pMax / niceInterval) * niceInterval;
   
   // 应用到图表
   chartInstance.setOption({
