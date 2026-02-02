@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-kmq(yab*k3=8!$^fp4pp27l_6+xm8c2lt&vzo#h8s=-4hki3vh
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
 
 # Application definition
@@ -124,6 +124,13 @@ STATIC_URL = 'static/'
 
 # CORS配置
 CORS_ALLOW_ALL_ORIGINS = True
+
+# Channels配置
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',
+    },
+}
 CORS_ALLOW_METHODS = [
     'GET',
     'POST',

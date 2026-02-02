@@ -80,6 +80,24 @@
               </el-form-item>
             </el-col>
           </el-row>
+          <el-row :gutter="20" v-if="tradeSettings.marketStage === 'oscillation'">
+            <el-col :span="24">
+              <el-form-item required>
+                <template #label>
+                  <div class="label-with-help">
+                    <span>震荡类型</span>
+                    <el-tooltip content="低位震荡只能买->卖，普通震荡可以买->卖/卖->买。" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </div>
+                </template>
+                <el-radio-group v-model="tradeSettings.oscillationType">
+                  <el-radio label="low">低位震荡</el-radio>
+                  <el-radio label="normal">普通震荡</el-radio>
+                </el-radio-group>
+              </el-form-item>
+            </el-col>
+          </el-row>
 
           <el-row :gutter="20" v-if="tradeSettings.marketStage">
             <el-col :span="24">
@@ -108,28 +126,102 @@
           <el-row :gutter="20" v-if="tradeSettings.marketStage === 'oscillation' && tradeSettings.strategy === 'grid'">
             <el-col :span="24">
               <el-form-item label-width="150px" label="高于均价格子数卖出">
-                <el-input-number v-model="tradeSettings.gridSellCount" :min="1" :max="100" />
+                <el-input 
+                  v-model.number="tradeSettings.gridSellCount" 
+                  type="number"
+                  placeholder=""
+                  clearable
+                  style="width: 300px"
+                  :disabled="(tradeSettings.sellAvgLineRangeMinus !== null && tradeSettings.sellAvgLineRangeMinus !== undefined && tradeSettings.sellAvgLineRangeMinus !== '') || (tradeSettings.sellAvgLineRangePlus !== null && tradeSettings.sellAvgLineRangePlus !== undefined && tradeSettings.sellAvgLineRangePlus !== '')"
+                />
               </el-form-item>
             </el-col>
             <el-col :span="24">
               <el-form-item label-width="150px" label="低于均价格子数买入">
-                <el-input-number v-model="tradeSettings.gridBuyCount" :min="1" :max="100" style="width: 300px" />
+                <el-input 
+                  v-model.number="tradeSettings.gridBuyCount" 
+                  type="number"
+                  placeholder=""
+                  clearable
+                  style="width: 300px"
+                  :disabled="(tradeSettings.buyAvgLineRangeMinus !== null && tradeSettings.buyAvgLineRangeMinus !== undefined && tradeSettings.buyAvgLineRangeMinus !== '') || (tradeSettings.buyAvgLineRangePlus !== null && tradeSettings.buyAvgLineRangePlus !== undefined && tradeSettings.buyAvgLineRangePlus !== '')"
+                />
               </el-form-item>
             </el-col>
           </el-row>
 
-          <el-row :gutter="20">
+          <el-row :gutter="20" v-if="tradeSettings.strategy === 'grid'">
             <el-col :span="24">
-              <el-form-item label="买入金额(元)">
-                <el-input-number v-model="tradeSettings.buyAmount" :min="1000" :max="1000000" :step="1000" style="width: 300px" />
+              <el-form-item>
+                <template #label>
+                  <div class="label-with-help">
+                    <span>均价线附近买入</span>
+                    <el-tooltip content="设置买入时的成交范围。左边框输入均价线以下的格子数，右边框输入均价线以上的格子数。例如左边0.1右边0.1，则在[均价线-0.1格, 均价线+0.1格]范围内均可买入。" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </div>
+                </template>
+                <div class="flex-align-center range-config-container">
+                  <span class="range-symbol minus-symbol" style="color: #67c23a; font-size: 1.4rem; font-weight: bold;">-</span>
+                  <el-input 
+                    v-model="tradeSettings.buyAvgLineRangeMinus" 
+                    :precision="2" 
+                    class="range-input" 
+                    style="width: 100px !important;" 
+                    :disabled="tradeSettings.gridBuyCount !== null && tradeSettings.gridBuyCount !== undefined && tradeSettings.gridBuyCount !== ''"
+                    placeholder=""
+                    clearable
+                  />
+                  <span class="center-text" style="margin: 0 15px; font-weight: bold;">均价线</span>
+                  <el-input 
+                    v-model="tradeSettings.buyAvgLineRangePlus" 
+                    :precision="2" 
+                    class="range-input" 
+                    style="width: 100px !important;" 
+                    :disabled="tradeSettings.gridBuyCount !== null && tradeSettings.gridBuyCount !== undefined && tradeSettings.gridBuyCount !== ''"
+                    placeholder=""
+                    clearable
+                  />
+                  <span class="range-symbol plus-symbol" style="color: #f56c6c; font-size: 1.4rem; font-weight: bold;">+</span>
+                </div>
               </el-form-item>
             </el-col>
           </el-row>
 
-          <el-row :gutter="20">
+          <el-row :gutter="20" v-if="tradeSettings.strategy === 'grid'">
             <el-col :span="24">
-              <el-form-item label="卖出金额(元)">
-                <el-input-number v-model="tradeSettings.sellAmount" :min="1000" :max="1000000" :step="1000" style="width: 300px" />
+              <el-form-item>
+                <template #label>
+                  <div class="label-with-help">
+                    <span>均价线附近卖出</span>
+                    <el-tooltip content="设置卖出时的成交范围。左边框输入均价线以下的格子数，右边框输入均价线以上的格子数。例如左边0.1右边0.1，则在[均价线-0.1格, 均价线+0.1格]范围内均可卖出。" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </div>
+                </template>
+                <div class="flex-align-center range-config-container">
+                  <span class="range-symbol minus-symbol" style="color: #67c23a; font-size: 1.4rem; font-weight: bold;">-</span>
+                  <el-input 
+                    v-model="tradeSettings.sellAvgLineRangeMinus" 
+                    :precision="2" 
+                    class="range-input" 
+                    style="width: 100px !important;" 
+                    :disabled="tradeSettings.gridSellCount !== null && tradeSettings.gridSellCount !== undefined && tradeSettings.gridSellCount !== ''"
+                    placeholder=""
+                    clearable
+                  />
+                  <span class="center-text" style="margin: 0 15px; font-weight: bold;">均价线</span>
+                  <el-input 
+                    v-model="tradeSettings.sellAvgLineRangePlus" 
+                    :precision="2" 
+                    class="range-input" 
+                    style="width: 100px !important;" 
+                    :disabled="tradeSettings.gridSellCount !== null && tradeSettings.gridSellCount !== undefined && tradeSettings.gridSellCount !== ''"
+                    placeholder=""
+                    clearable
+                  />
+                  <span class="range-symbol plus-symbol" style="color: #f56c6c; font-size: 1.4rem; font-weight: bold;">+</span>
+                </div>
               </el-form-item>
             </el-col>
           </el-row>
@@ -146,6 +238,31 @@
             <el-col :span="24">
               <el-form-item label="卖出股数(股)">
                 <el-input-number v-model="tradeSettings.sellShares" :min="100" :max="100000" :step="100" style="width: 300px" />
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="20">
+            <el-col :span="24">
+              <el-form-item label="数据记录">
+                <el-checkbox v-model="tradeSettings.recordData">监控时存储原始数据</el-checkbox>
+                <el-tooltip content="开启后，停止监控时会将 API 原始响应保存为 JSON 文件。" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="20">
+            <el-col :span="24">
+              <el-form-item label="回测文件路径">
+                <el-input v-model="tradeSettings.mockFilePath" placeholder="如：F:\traeProject\2026-01-30-603069-海汽集团.json" style="width: 100%">
+                  <template #append>
+                    <el-tooltip content="留空则请求真实接口。输入完整路径后，监控将从该文件读取数据。" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </template>
+                </el-input>
               </el-form-item>
             </el-col>
           </el-row>
@@ -333,21 +450,29 @@ import { ref, reactive, onMounted, onUnmounted, watch, inject } from 'vue';
 import axios from 'axios';
 // 引入股票图表组件
 import StockChart from '../components/StockChart.vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
+import { QuestionFilled } from '@element-plus/icons-vue';
 
 const tradeSettings = reactive({
   stockCode: '603069',
   updateInterval: 5,
-  buyAmount: 10000,
-  sellAmount: 10000,
   buyShares: null,
   sellShares: null,
   sellThreshold: 0.5,
   buyThreshold: 0.5,
-  marketStage: '', // 'oscillation', 'downward', 'upward'
+  marketStage: 'oscillation', // 'oscillation', 'downward', 'upward'
+  oscillationType: 'normal', // 'low', 'normal'
   strategy: 'grid', // 'grid', 'percentage'
-  gridBuyCount: 1,
-  gridSellCount: 1,
+  gridBuyCount: null,
+  gridSellCount: null,
+  buyAvgLineRangeMinus: null,
+  buyAvgLineRangePlus: null,
+  sellAvgLineRangeMinus: null,
+  sellAvgLineRangePlus: null,
+  recordData: false,
+  mockFilePath: '',
+  overnightSellRatio: 1.0,
+  overnightBuyRatio: 1.0,
 });
 
 const realtimeData = reactive({
@@ -366,7 +491,7 @@ const pendingLoop = reactive({
   price: null,
   volume: null,
   timestamp: null,
-  overnightRatio: 0
+  overnightRatio: 1.0
 });
 const clearDialogVisible = ref(false);
 const monitoringTimer = ref(null);
@@ -386,47 +511,19 @@ const chartData = reactive({
 let ws = null;
 const isWebSocketConnected = ref(false);
 
-// 监听买入金额变化，自动清空买入股数
-watch(
-  () => tradeSettings.buyAmount,
-  (newVal) => {
-    if (newVal !== null && newVal !== undefined) {
-      tradeSettings.buyShares = null;
+// 过滤辅助函数：将 undefined 和空字符串转换为 null，以便后端能够识别并清空数据库字段
+const filterEmptyFields = (obj) => {
+  const newObj = {};
+  Object.keys(obj).forEach(key => {
+    const value = obj[key];
+    if (value === undefined || value === '') {
+      newObj[key] = null;
+    } else {
+      newObj[key] = value;
     }
-  }
-);
-
-// 监听买入股数变化，自动清空买入金额
-watch(
-  () => tradeSettings.buyShares,
-  (newVal) => {
-    if (newVal !== null && newVal !== undefined) {
-      tradeSettings.buyAmount = null;
-    }
-  }
-);
-
-// 监听卖出金额变化，自动清空卖出股数
-watch(
-  () => tradeSettings.sellAmount,
-  (newVal) => {
-    if (newVal !== null && newVal !== undefined) {
-      tradeSettings.sellShares = null;
-    }
-  }
-);
-
-// 监听卖出股数变化，自动清空卖出金额
-watch(
-  () => tradeSettings.sellShares,
-  (newVal) => {
-    if (newVal !== null && newVal !== undefined) {
-      tradeSettings.sellAmount = null;
-    }
-  }
-);
-
-
+  });
+  return newObj;
+};
 
 // 更新图表数据
 const updateChartData = () => {
@@ -485,7 +582,7 @@ const fetchStockData = async () => {
       accountSettings.availableShares = data.account.available_shares;
     }
 
-    updateChart();
+    updateChartData();
 
     // 获取最新的交易记录
     await fetchTradeRecords();
@@ -515,6 +612,18 @@ const fetchTradeLoops = async () => {
   try {
     const response = await axios.get(`/api/trade-loops/${tradeSettings.stockCode}/`);
     tradeLoops.value = response.data;
+    
+    // 检查是否有未闭环的交易，如果前端挂起状态为空，则尝试从闭环记录恢复
+    const unclosedLoop = tradeLoops.value.find(loop => !loop.is_closed);
+    if (unclosedLoop && !pendingLoop.type) {
+      pendingLoop.type = unclosedLoop.loop_type === 'buy_sell' ? 'buy_first' : 'sell_first';
+      pendingLoop.price = unclosedLoop.open_price;
+      pendingLoop.volume = unclosedLoop.open_volume; // 注意：需要后端返回这个字段
+      pendingLoop.timestamp = unclosedLoop.open_time;
+      
+      // 这里的 overnightRatio 会在 fetchTradeSetting 中获取，或者保持默认 1.0
+      console.log('从闭环交易记录中恢复挂起状态:', pendingLoop.type);
+    }
   } catch (error) {
     console.error('获取闭环交易记录失败:', error);
   }
@@ -533,7 +642,7 @@ const profitInfo = inject(
 
 // 计算交易闭环的盈利
 const calculateProfit = (records) => {
-  if (!records || records.length < 2) {
+  if (!records || records.length === 0) {
     profitInfo.type = '';
     profitInfo.amount = 0;
     profitInfo.unit = '';
@@ -544,24 +653,17 @@ const calculateProfit = (records) => {
   // 按时间排序，最新的在前面
   const sortedRecords = [...records].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-  // 计算所有买入和卖出交易的盈利总和
-  let totalBuyAmount = 0;
-  let totalSellAmount = 0;
-  let buyCount = 0;
-  let sellCount = 0;
+  // 计算所有买入和卖出交易的盈亏总和
+  let totalProfit = 0;
 
   for (const record of sortedRecords) {
-    if (record.trade_type === 'buy') {
-      totalBuyAmount += record.amount;
-      buyCount++;
-    } else if (record.trade_type === 'sell') {
-      totalSellAmount += record.amount;
-      sellCount++;
+    if (record.trade_type === 'sell') {
+      totalProfit += record.amount;
+    } else if (record.trade_type === 'buy') {
+      totalProfit -= record.amount;
     }
   }
 
-  // 计算总盈利
-  let totalProfit = totalSellAmount - totalBuyAmount;
   let unit = '元';
   let type = '总盈亏';
 
@@ -582,19 +684,18 @@ const calculateProfit = (records) => {
   profitInfo.status = status;
 };
 
-// 获取初始化账户信息
+// 获取账户设置
 const fetchAccountSettings = async () => {
+  if (!tradeSettings.stockCode || tradeSettings.stockCode.length !== 6) return;
   try {
-    // 保存账户设置到后端
-    await axios.post(`/api/account/`, {
-      stock_code: tradeSettings.stockCode,
-      balance: accountSettings.balance,
-      shares: accountSettings.shares,
-      available_shares: accountSettings.availableShares,
-    });
+    const response = await axios.get(`/api/account/?stock_code=${tradeSettings.stockCode}`);
+    if (response.data) {
+      accountSettings.balance = response.data.balance;
+      accountSettings.shares = response.data.shares;
+      accountSettings.availableShares = response.data.available_shares;
+    }
   } catch (error) {
     console.error('获取账户设置失败:', error);
-    ElMessage.error('获取账户设置失败，请检查网络连接');
   }
 };
 
@@ -605,20 +706,25 @@ const connectWebSocket = async () => {
     await fetchAccountSettings();
     
     // 保存交易设置到后端
-    await axios.post('/api/trade-setting/', {
+    const tradeSettingData = filterEmptyFields({
       stock_code: tradeSettings.stockCode,
       sell_threshold: tradeSettings.sellThreshold,
       buy_threshold: tradeSettings.buyThreshold,
-      buy_amount: tradeSettings.buyAmount,
-      sell_amount: tradeSettings.sellAmount,
       buy_shares: tradeSettings.buyShares,
       sell_shares: tradeSettings.sellShares,
       update_interval: tradeSettings.updateInterval,
       market_stage: tradeSettings.marketStage,
+      oscillation_type: tradeSettings.oscillationType,
+      buy_avg_line_range_minus: tradeSettings.buyAvgLineRangeMinus,
+      buy_avg_line_range_plus: tradeSettings.buyAvgLineRangePlus,
+      sell_avg_line_range_minus: tradeSettings.sellAvgLineRangeMinus,
+      sell_avg_line_range_plus: tradeSettings.sellAvgLineRangePlus,
       strategy: tradeSettings.strategy,
       grid_buy_count: tradeSettings.gridBuyCount,
       grid_sell_count: tradeSettings.gridSellCount,
     });
+    
+    await axios.post('/api/trade-setting/', tradeSettingData);
 
     // 确保stockCode是字符串类型
     const stockCodeStr = String(tradeSettings.stockCode).trim();
@@ -653,7 +759,9 @@ const connectWebSocket = async () => {
       
       // 发送开始监控消息
       ws.send(JSON.stringify({
-        type: 'start_monitoring'
+        type: 'start_monitoring',
+        record_data: tradeSettings.recordData,
+        mock_file_path: tradeSettings.mockFilePath
       }));
       
       ElMessage.success('已连接到WebSocket服务器，开始监控');
@@ -740,12 +848,6 @@ const handleWebSocketMessage = (message) => {
         pendingLoop.price = message.trade_setting.pending_price;
         pendingLoop.volume = message.trade_setting.pending_volume;
         pendingLoop.timestamp = message.trade_setting.pending_timestamp;
-        
-        if (pendingLoop.type === 'buy_first') {
-          pendingLoop.overnightRatio = message.trade_setting.overnight_sell_ratio;
-        } else if (pendingLoop.type === 'sell_first') {
-          pendingLoop.overnightRatio = message.trade_setting.overnight_buy_ratio;
-        }
       }
       
       // 更新图表数据
@@ -781,6 +883,24 @@ const disconnectWebSocket = () => {
 
 // 开始监控
 const startMonitoring = async () => {
+  // 校验卖出股数是否大于可用持股
+  if (tradeSettings.sellShares && accountSettings.availableShares && tradeSettings.sellShares > accountSettings.availableShares) {
+    try {
+      await ElMessageBox.confirm(
+        `当前卖出设置 (${tradeSettings.sellShares}股) 大于可用持股 (${accountSettings.availableShares}股)，系统可能无法执行卖出交易。是否继续？`,
+        '持仓不足提醒',
+        {
+          confirmButtonText: '确定继续',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
+      );
+    } catch (error) {
+      // 用户点击取消，直接返回
+      return;
+    }
+  }
+
   // 停止现有的HTTP轮询（如果存在）
   if (monitoringTimer.value) {
     clearInterval(monitoringTimer.value);
@@ -805,20 +925,21 @@ const stopMonitoring = () => {
   disconnectWebSocket();
 };
 
-// 保存账户设置
+// 保存账户设置到后端
 const saveAccountSettings = async () => {
   try {
-    await axios.post(`/api/account/`, {
+    const accountData = filterEmptyFields({
       stock_code: tradeSettings.stockCode,
       balance: accountSettings.balance,
       shares: accountSettings.shares,
       available_shares: accountSettings.availableShares,
     });
-
-    ElMessage.success('账户设置保存成功');
+    
+    await axios.post(`/api/account/`, accountData);
+    ElMessage.success('账户设置已保存');
   } catch (error) {
     console.error('保存账户设置失败:', error);
-    ElMessage.error('保存账户设置失败，请检查网络连接');
+    ElMessage.error('保存账户设置失败');
   }
 };
 
@@ -827,15 +948,29 @@ const saveOvernightRatio = async () => {
   try {
     const data = {
       stock_code: tradeSettings.stockCode,
+      overnight_sell_ratio: null,
+      overnight_buy_ratio: null,
     };
+    
+    // 如果存在挂起任务，根据挂起类型只更新对应的比例，另一个传 null
     if (pendingLoop.type === 'buy_first') {
       data.overnight_sell_ratio = pendingLoop.overnightRatio;
+      tradeSettings.overnightSellRatio = pendingLoop.overnightRatio;
     } else if (pendingLoop.type === 'sell_first') {
       data.overnight_buy_ratio = pendingLoop.overnightRatio;
+      tradeSettings.overnightBuyRatio = pendingLoop.overnightRatio;
+    } else {
+      // 如果没有挂起任务，则使用 tradeSettings 中的值
+      data.overnight_sell_ratio = tradeSettings.overnightSellRatio;
+      data.overnight_buy_ratio = tradeSettings.overnightBuyRatio;
     }
     
+    console.log('DEBUG: 准备保存的隔夜比例数据:', data);
     await axios.post('/api/trade-setting/', data);
+    
     ElMessage.success('隔夜比例保存成功');
+    // 保存后重新获取一次设置，确保状态一致
+    await fetchTradeSetting();
   } catch (error) {
     console.error('保存隔夜比例失败:', error);
     ElMessage.error('保存隔夜比例失败');
@@ -861,6 +996,12 @@ const clearTradeRecords = async () => {
     // 清空前端交易记录
     tradeRecords.value = [];
     tradeLoops.value = [];
+    
+    // 清空前端挂起状态
+    pendingLoop.type = null;
+    pendingLoop.price = null;
+    pendingLoop.volume = null;
+    pendingLoop.timestamp = null;
 
     // 清空盈利信息
     profitInfo.value = {
@@ -881,20 +1022,93 @@ const clearTradeRecords = async () => {
   }
 };
 
-// 监听股票代码变化，当长度为6位时自动加载数据
-watch(
-  () => tradeSettings.stockCode,
-  (newVal) => {
-    if (newVal && newVal.length === 6) {
-      fetchTradeRecords();
-      fetchTradeLoops();
+// 从后端获取交易设置
+const fetchTradeSetting = async () => {
+  if (!tradeSettings.stockCode || tradeSettings.stockCode.length !== 6) return;
+  try {
+    const response = await axios.get(`/api/trade-setting/`, {
+      params: { stock_code: tradeSettings.stockCode }
+    });
+    const data = response.data.data;
+    console.log('DEBUG: 获取到的交易设置数据:', data);
+    
+    // 更新本地设置
+    tradeSettings.sellThreshold = data.sell_threshold;
+    tradeSettings.buyThreshold = data.buy_threshold;
+    tradeSettings.buyShares = data.buy_shares;
+    tradeSettings.sellShares = data.sell_shares;
+    tradeSettings.updateInterval = data.update_interval;
+    tradeSettings.marketStage = data.market_stage || 'oscillation';
+    tradeSettings.oscillationType = data.oscillation_type || 'normal';
+    tradeSettings.strategy = data.strategy || 'grid';
+    tradeSettings.gridBuyCount = data.grid_buy_count;
+    tradeSettings.gridSellCount = data.grid_sell_count;
+    tradeSettings.buyAvgLineRangeMinus = data.buy_avg_line_range_minus;
+    tradeSettings.buyAvgLineRangePlus = data.buy_avg_line_range_plus;
+    tradeSettings.sellAvgLineRangeMinus = data.sell_avg_line_range_minus;
+    tradeSettings.sellAvgLineRangePlus = data.sell_avg_line_range_plus;
+
+    // 更新挂起状态和隔夜比例
+    if (data.pending_loop_type) {
+      pendingLoop.type = data.pending_loop_type;
+      pendingLoop.price = data.pending_price;
+      pendingLoop.volume = data.pending_volume;
+      pendingLoop.timestamp = data.pending_timestamp;
+    } else {
+      pendingLoop.type = null;
+      pendingLoop.price = null;
+      pendingLoop.volume = null;
+      pendingLoop.timestamp = null;
     }
+
+    // 保存后端返回的比例到本地，以便切换显示
+    if (data.overnight_sell_ratio !== undefined) {
+      tradeSettings.overnightSellRatio = data.overnight_sell_ratio !== null ? Number(data.overnight_sell_ratio) : 1.0;
+    }
+    if (data.overnight_buy_ratio !== undefined) {
+      tradeSettings.overnightBuyRatio = data.overnight_buy_ratio !== null ? Number(data.overnight_buy_ratio) : 1.0;
+    }
+
+    // 根据当前挂起类型显示对应的比例
+    if (pendingLoop.type === 'sell_first') {
+      pendingLoop.overnightRatio = tradeSettings.overnightBuyRatio;
+    } else {
+      // 默认为 buy_first 或无任务时显示卖出比例
+      pendingLoop.overnightRatio = tradeSettings.overnightSellRatio;
+    }
+    
+    // 如果没有 pendingLoop.type，说明目前没有未闭环任务，则不锁定输入框
+    if (!pendingLoop.type) {
+      tradeSettings.gridSellCount = data.grid_sell_count;
+      tradeSettings.gridBuyCount = data.grid_buy_count;
+      tradeSettings.sellAvgLineRangeMinus = data.sell_avg_line_range_minus;
+      tradeSettings.sellAvgLineRangePlus = data.sell_avg_line_range_plus;
+      tradeSettings.buyAvgLineRangeMinus = data.buy_avg_line_range_minus;
+      tradeSettings.buyAvgLineRangePlus = data.buy_avg_line_range_plus;
+    }
+
+    console.log('DEBUG: 处理后的比例 - 卖出:', tradeSettings.overnightSellRatio, '买入:', tradeSettings.overnightBuyRatio, '当前显示:', pendingLoop.overnightRatio);
+  } catch (error) {
+    console.error('获取交易设置失败:', error);
   }
-);
+};
+
+// 监听股票代码变化
+watch(() => tradeSettings.stockCode, (newVal) => {
+  if (newVal && newVal.length === 6) {
+    fetchStockData();
+    fetchAccountSettings();
+    fetchTradeSetting();
+    fetchTradeRecords();
+    fetchTradeLoops();
+  }
+});
 
 onMounted(() => {
-  // 页面加载时，如果已有6位代码，则加载数据
   if (tradeSettings.stockCode && tradeSettings.stockCode.length === 6) {
+    fetchStockData();
+    fetchAccountSettings();
+    fetchTradeSetting();
     fetchTradeRecords();
     fetchTradeLoops();
   }
@@ -1020,6 +1234,70 @@ onUnmounted(() => {
   margin: 10px 0 0 0;
   white-space: pre-line;
   font-size: 0.9rem;
+}
+
+/* 均价线范围配置样式 */
+.range-config-container {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.range-label {
+  font-size: 0.9rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.help-icon {
+  margin-left: 4px;
+  font-size: 14px;
+  color: #909399;
+  cursor: help;
+}
+
+.label-with-help {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.buy-label {
+  color: #67c23a;
+  margin-right: 5px;
+}
+
+.sell-label {
+  color: #f56c6c;
+  margin-left: 5px;
+}
+
+.range-symbol {
+  font-size: 1.4rem;
+  font-weight: bold;
+  padding: 0 5px;
+}
+
+.minus-symbol {
+  color: #67c23a;
+}
+
+.plus-symbol {
+  color: #f56c6c;
+}
+
+.center-text {
+  font-weight: bold;
+  margin: 0 15px;
+  color: #303133;
+}
+
+:deep(.range-input) {
+  width: 100px !important;
+}
+
+:deep(.range-input .el-input__inner) {
+  text-align: center;
 }
 
 /* 为el-input-number组件设置固定宽度 */

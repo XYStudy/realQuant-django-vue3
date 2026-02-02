@@ -6,5 +6,6 @@ urlpatterns = [
     path('trade-records/<str:stock_code>/', views.trade_records, name='trade_records'),
     path('trade-loops/<str:stock_code>/', views.trade_loops, name='trade_loops'),
     path('trade-setting/', views.update_trade_setting, name='update_trade_setting'),
-    path('account/', views.update_account, name='update_account'),
+    path('account/', views.account_api, name='account_api'),
+    path('trade-callback/', views.trade_callback, name='trade_callback'),
 ]

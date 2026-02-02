@@ -48,7 +48,7 @@ class TradeRecord(models.Model):
 
 class Account(models.Model):
     """
-    账户模型，用于管理账户资金和持股情况
+    账户模型，用于 management 账户资金和持股情况
     """
     stock_code = models.CharField(max_length=10, verbose_name='股票代码')
     balance = models.DecimalField(max_digits=12, decimal_places=2, default=100000.00, verbose_name='账户余额')
@@ -80,24 +80,37 @@ class TradeSetting(models.Model):
         ('percentage', '百分比做T'),
     )
 
-    stock_code = models.CharField(max_length=10, verbose_name='股票代码')
+    OSCILLATION_TYPE_CHOICES = (
+        ('low', '低位震荡'),
+        ('normal', '普通震荡'),
+    )
+
+    stock_code = models.CharField(max_length=10, unique=True, verbose_name='股票代码')
     market_stage = models.CharField(max_length=20, choices=STAGE_CHOICES, null=True, blank=True, verbose_name='行情阶段')
+    oscillation_type = models.CharField(max_length=20, choices=OSCILLATION_TYPE_CHOICES, null=True, blank=True, verbose_name='震荡类型')
     strategy = models.CharField(max_length=20, choices=STRATEGY_CHOICES, default='grid', verbose_name='交易策略')
     
     # 百分比策略字段
     sell_threshold = models.DecimalField(max_digits=5, decimal_places=2, default=0.5, verbose_name='高于均价卖出阈值(%)')
     buy_threshold = models.DecimalField(max_digits=5, decimal_places=2, default=0.5, verbose_name='低于均价买入阈值(%)')
     
+    # 均价线买入区间字段
+    buy_avg_line_range_minus = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, verbose_name='均价线买入左区间(-)')
+    buy_avg_line_range_plus = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, verbose_name='均价线买入右区间(+)')
+    
+    # 均价线卖出区间字段
+    sell_avg_line_range_minus = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, verbose_name='均价线卖出左区间(-)')
+    sell_avg_line_range_plus = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, verbose_name='均价线卖出右区间(+)')
+    
     # 格子策略字段
-    grid_buy_count = models.IntegerField(default=1, verbose_name='低于均价格子数买入')
-    grid_sell_count = models.IntegerField(default=1, verbose_name='高于均价格子数卖出')
+    grid_buy_count = models.IntegerField(null=True, blank=True, verbose_name='低于均价格子数买入')
+    grid_sell_count = models.IntegerField(null=True, blank=True, verbose_name='高于均价格子数卖出')
 
-    buy_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, verbose_name='买入金额(元)')
-    sell_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, verbose_name='卖出金额(元)')
     buy_shares = models.IntegerField(null=True, blank=True, verbose_name='买入股数(股)')
     sell_shares = models.IntegerField(null=True, blank=True, verbose_name='卖出股数(股)')
     update_interval = models.IntegerField(default=5, verbose_name='更新频率(秒)')
     is_active = models.BooleanField(default=True, verbose_name='是否激活')
+    is_executing = models.BooleanField(default=False, verbose_name='是否正在执行交易')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 

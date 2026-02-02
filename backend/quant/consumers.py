@@ -1,9 +1,12 @@
 # quant/consumers.py
 import asyncio
 import json
+import os
+from datetime import datetime
 from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
-from quant.services.stock_service import StockDataService
+from quant.services.stock_service import StockDataService, send_execution_request
+# from quant.services.monitor_manager import monitor_manager # 移动到方法内
 from quant.models import TradeSetting, Account, TradeRecord, TradeLoop
 from decimal import Decimal
 from django.utils import timezone
@@ -11,38 +14,40 @@ from django.utils import timezone
 # 同步辅助函数
 def get_trade_setting_sync(stock_code):
     """获取交易设置（同步函数）"""
-    setting, _ = TradeSetting.objects.get_or_create(
-        stock_code=stock_code,
-        defaults={
-            'sell_threshold': Decimal('0.5'),
-            'buy_threshold': Decimal('0.5'),
-            'buy_amount': Decimal('10000'),
-            'sell_amount': Decimal('10000'),
-            'update_interval': 5,
-            'is_active': True
-        }
-    )
-    return {
-        'id': setting.id,
-        'stock_code': setting.stock_code,
-        'strategy': setting.strategy,
-        'sell_threshold': float(setting.sell_threshold),
-        'buy_threshold': float(setting.buy_threshold),
-        'buy_amount': float(setting.buy_amount) if setting.buy_amount else None,
-        'sell_amount': float(setting.sell_amount) if setting.sell_amount else None,
-        'buy_shares': setting.buy_shares,
-        'sell_shares': setting.sell_shares,
-        'pending_loop_type': setting.pending_loop_type,
-        'pending_price': float(setting.pending_price) if setting.pending_price else None,
-        'pending_volume': setting.pending_volume,
-        'pending_timestamp': setting.pending_timestamp,
-        'overnight_sell_ratio': float(setting.overnight_sell_ratio),
-        'overnight_buy_ratio': float(setting.overnight_buy_ratio),
-    }
+    try:
+        # 使用 values() 直接获取字典数据，绕过模型实例缓存
+        setting_dict = TradeSetting.objects.filter(stock_code=stock_code).values().first()
+        
+        if not setting_dict:
+            print(f"DEBUG WS: 未找到股票 {stock_code} 的设置，创建新设置")
+            new_setting = TradeSetting.objects.create(
+                stock_code=stock_code,
+                sell_threshold=Decimal('0.5'),
+                buy_threshold=Decimal('0.5'),
+                update_interval=5,
+                is_active=True,
+                is_executing=False
+            )
+            setting_dict = TradeSetting.objects.filter(id=new_setting.id).values().first()
+        else:
+            print(f"DEBUG WS: 获取到股票 {stock_code} 的设置, pending_type={setting_dict.get('pending_loop_type')}")
+        
+        # 将 Decimal 转换为 float，处理 datetime
+        if setting_dict:
+            for key, value in setting_dict.items():
+                if isinstance(value, Decimal):
+                    setting_dict[key] = float(value)
+                elif isinstance(value, datetime):
+                    setting_dict[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+                    
+        return setting_dict
+    except Exception as e:
+        print(f"获取交易设置失败: {e}")
+        return None
 
 def get_account_sync(stock_code):
-    """获取账户信息（同步函数）"""
-    account, _ = Account.objects.get_or_create(
+    """获取账户信息（同步函数，包含T+1同步逻辑）"""
+    account, created = Account.objects.get_or_create(
         stock_code=stock_code,
         defaults={
             'balance': Decimal('100000.00'),
@@ -50,6 +55,15 @@ def get_account_sync(stock_code):
             'available_shares': 3000
         }
     )
+    
+    # T+1 同步逻辑：如果当前日期大于上次更新日期，则将可用持仓同步为当前总持仓
+    now = timezone.now()
+    if not created and account.updated_at.date() < now.date():
+        old_available = account.available_shares
+        account.available_shares = account.shares
+        account.save()
+        print(f"DEBUG WS: 账户 {stock_code} 可用持仓已根据 T+1 规则同步: {old_available} -> {account.available_shares}")
+    
     return {
         'id': account.id,
         'balance': float(account.balance),
@@ -87,14 +101,16 @@ def create_trade_and_update_loop_sync(stock_code, trade_type, price, volume, amo
     )
     
     # 2. 更新闭环状态
-    setting = TradeSetting.objects.get(stock_code=stock_code)
+    setting_query = TradeSetting.objects.filter(stock_code=stock_code)
+    setting = setting_query.first()
     if setting.pending_loop_type is None:
         # 开启新闭环
-        setting.pending_loop_type = 'buy_first' if trade_type == 'buy' else 'sell_first'
-        setting.pending_price = price
-        setting.pending_volume = volume
-        setting.pending_timestamp = trade_record.timestamp
-        setting.save()
+        setting_query.update(
+            pending_loop_type='buy_first' if trade_type == 'buy' else 'sell_first',
+            pending_price=price,
+            pending_volume=volume,
+            pending_timestamp=trade_record.timestamp
+        )
         
         # 创建待闭环记录
         TradeLoop.objects.create(
@@ -118,11 +134,12 @@ def create_trade_and_update_loop_sync(stock_code, trade_type, price, volume, amo
             loop.save()
             
         # 清除设置中的待闭环状态
-        setting.pending_loop_type = None
-        setting.pending_price = None
-        setting.pending_volume = None
-        setting.pending_timestamp = None
-        setting.save()
+        setting_query.update(
+            pending_loop_type=None,
+            pending_price=None,
+            pending_volume=None,
+            pending_timestamp=None
+        )
         
     return {
         'id': trade_record.id,
@@ -154,13 +171,15 @@ def get_trade_records_sync(stock_code):
 
 def update_trade_loop_sync(setting, trade_record):
     """更新交易闭环状态（同步函数）"""
+    setting_query = TradeSetting.objects.filter(stock_code=setting.stock_code)
     if setting.pending_loop_type is None:
         # 开启新闭环
-        setting.pending_loop_type = 'buy_first' if trade_record.trade_type == 'buy' else 'sell_first'
-        setting.pending_price = trade_record.price
-        setting.pending_volume = trade_record.volume
-        setting.pending_timestamp = trade_record.timestamp
-        setting.save()
+        setting_query.update(
+            pending_loop_type='buy_first' if trade_record.trade_type == 'buy' else 'sell_first',
+            pending_price=trade_record.price,
+            pending_volume=trade_record.volume,
+            pending_timestamp=trade_record.timestamp
+        )
         
         # 创建待闭环记录
         TradeLoop.objects.create(
@@ -184,11 +203,25 @@ def update_trade_loop_sync(setting, trade_record):
             loop.save()
             
         # 清除设置中的待闭环状态
-        setting.pending_loop_type = None
-        setting.pending_price = None
-        setting.pending_volume = None
-        setting.pending_timestamp = None
-        setting.save()
+        setting_query.update(
+            pending_loop_type=None,
+            pending_price=None,
+            pending_volume=None,
+            pending_timestamp=None
+        )
+
+def set_trade_executing_sync(stock_code, is_executing):
+    """更新交易执行状态（同步函数）"""
+    TradeSetting.objects.filter(stock_code=stock_code).update(is_executing=is_executing)
+
+def try_lock_trade_executing_sync(stock_code):
+    """尝试获取交易执行锁（原子操作）"""
+    # 仅当 is_executing 为 False 时，才更新为 True
+    updated_count = TradeSetting.objects.filter(
+        stock_code=stock_code, 
+        is_executing=False
+    ).update(is_executing=True)
+    return updated_count > 0
 
 def get_trade_loops_sync(stock_code):
     """获取闭环交易记录（同步函数）"""
@@ -222,13 +255,24 @@ class StockDataConsumer(AsyncWebsocketConsumer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stock_code = None
+        self.stock_name = "未知股票"
         self.monitoring = False
         self.monitor_task = None
+        self.recorded_data = []
+        self.record_data_enabled = False
+        self.mock_file_path = None
     
     async def connect(self):
         """处理WebSocket连接"""
         # 获取股票代码
         self.stock_code = self.scope['url_route']['kwargs']['stock_code']
+        self.group_name = f"stock_{self.stock_code}"
+        
+        # 加入频道组
+        await self.channel_layer.group_add(
+            self.group_name,
+            self.channel_name
+        )
         
         # 接受连接
         await self.accept()
@@ -242,8 +286,11 @@ class StockDataConsumer(AsyncWebsocketConsumer):
     
     async def disconnect(self, close_code):
         """处理WebSocket断开连接"""
-        # 停止监控
-        await self.stop_monitoring()
+        # 离开频道组
+        await self.channel_layer.group_discard(
+            self.group_name,
+            self.channel_name
+        )
     
     async def receive(self, text_data):
         """处理从客户端接收的消息"""
@@ -251,193 +298,85 @@ class StockDataConsumer(AsyncWebsocketConsumer):
         message_type = text_data_json.get('type')
         
         if message_type == 'start_monitoring':
+            self.record_data_enabled = text_data_json.get('record_data', False)
+            self.mock_file_path = text_data_json.get('mock_file_path')
             await self.start_monitoring()
         elif message_type == 'stop_monitoring':
             await self.stop_monitoring()
     
     async def start_monitoring(self):
         """开始监控股票数据"""
-        if self.monitoring:
-            return
-        
-        self.monitoring = True
-        
-        # 发送开始监控消息
-        await self.send(text_data=json.dumps({
-            'type': 'monitoring_status',
-            'status': 'started',
-            'message': '开始监控股票数据'
-        }))
-        
-        # 启动监控任务
-        self.monitor_task = asyncio.create_task(self.monitor_stock_data())
-    
+        try:
+            from quant.services.monitor_manager import monitor_manager
+            # 调用全局监控管理器启动任务
+            print(f"DEBUG WS: 正在为 {self.stock_code} 启动监控任务...")
+            await monitor_manager.start_monitoring(
+                self.stock_code, 
+                self.record_data_enabled, 
+                self.mock_file_path
+            )
+            
+            self.monitoring = True
+            
+            # 发送开始监控消息
+            await self.send(text_data=json.dumps({
+                'type': 'monitoring_status',
+                'status': 'started',
+                'message': '后台监控任务已启动'
+            }))
+            print(f"DEBUG WS: {self.stock_code} 监控任务启动成功消息已发送")
+        except Exception as e:
+            print(f"ERROR WS: 启动监控任务失败 {self.stock_code}: {e}")
+            import traceback
+            traceback.print_exc()
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': f'启动监控失败: {str(e)}'
+            }))
+
     async def stop_monitoring(self):
         """停止监控股票数据"""
-        self.monitoring = False
+        if not self.monitoring:
+            return
+            
+        from quant.services.monitor_manager import monitor_manager
+        # 调用全局监控管理器停止任务
+        await monitor_manager.stop_monitoring(self.stock_code)
         
-        if self.monitor_task:
-            self.monitor_task.cancel()
-            self.monitor_task = None
+        self.monitoring = False
         
         # 发送停止监控消息
         await self.send(text_data=json.dumps({
             'type': 'monitoring_status',
             'status': 'stopped',
-            'message': '停止监控股票数据'
+            'message': '后台监控任务已停止'
         }))
-    
-    async def monitor_stock_data(self):
-        """监控股票数据，定时获取并发送给客户端"""
+
+    async def stock_update(self, event):
+        """处理来自频道组的股票更新消息"""
         try:
-            while self.monitoring:
-                # 获取股票数据
-                stock_data = await sync_to_async(StockDataService.get_stock_data)(self.stock_code)
-                
-                if stock_data:
-                    # 获取交易设置（返回字典）
-                    trade_setting = await sync_to_async(get_trade_setting_sync)(self.stock_code)
-                    
-                    # 获取账户信息（返回字典）
-                    account = await sync_to_async(get_account_sync)(self.stock_code)
-                    
-                    # 检查交易条件
-                    should_trade, trade_type, reason = await sync_to_async(StockDataService.check_trade_condition)(
-                        stock_data, 
-                        trade_setting
-                    )
-                    
-                    trade_record = None
-                    
-                    if should_trade:
-                        # 执行交易
-                        if trade_type == 'buy':
-                            # 计算买入股数
-                            if trade_setting['pending_loop_type'] == 'sell_first':
-                                # 如果是卖出闭环，买入数量必须等于之前的卖出数量
-                                trade_volume = trade_setting['pending_volume']
-                            elif trade_setting['buy_shares']:
-                                trade_volume = trade_setting['buy_shares']
-                            else:
-                                # 计算交易数量，向下取整到100股的倍数
-                                _temp_buy_amount = Decimal(str(trade_setting['buy_amount'] or '10000'))
-                                _temp_price = Decimal(str(stock_data['current_price']))
-                                trade_volume = int(_temp_buy_amount / _temp_price / Decimal('100')) * 100
-                            
-                            # 确保是100股的倍数且至少100股
-                            trade_volume = max(100, (trade_volume // 100) * 100)
-                            
-                            # 计算实际交易金额
-                            current_price = Decimal(str(stock_data['current_price']))
-                            actual_trade_amount = current_price * Decimal(str(trade_volume))
-                            
-                            # 检查账户余额是否足够
-                            if Decimal(str(account['balance'])) >= actual_trade_amount:
-                                # 保存交易记录并更新闭环
-                                trade_record = await sync_to_async(create_trade_and_update_loop_sync)(
-                                    self.stock_code,
-                                    'buy',
-                                    stock_data['current_price'],
-                                    trade_volume,
-                                    actual_trade_amount,
-                                    reason
-                                )
-                                
-                                # 更新账户信息
-                                account = await sync_to_async(update_account_after_trade_sync)(
-                                    self.stock_code,
-                                    'buy',
-                                    trade_volume,
-                                    actual_trade_amount
-                                )
-                                
-                                # 重新获取交易设置以获取最新闭环状态
-                                trade_setting = await sync_to_async(get_trade_setting_sync)(self.stock_code)
-                        
-                        elif trade_type == 'sell':
-                            # 计算卖出股数
-                            if trade_setting['pending_loop_type'] == 'buy_first':
-                                # 如果是买入闭环，卖出数量必须等于之前的买入数量
-                                trade_volume = trade_setting['pending_volume']
-                            elif trade_setting['sell_shares']:
-                                trade_volume = trade_setting['sell_shares']
-                            else:
-                                # 计算交易数量，向下取整到100股的倍数
-                                _temp_sell_amount = Decimal(str(trade_setting['sell_amount'] or '10000'))
-                                _temp_price = Decimal(str(stock_data['current_price']))
-                                trade_volume = int(_temp_sell_amount / _temp_price / Decimal('100')) * 100
-                            
-                            # 确保是100股的倍数且至少100股
-                            trade_volume = max(100, (trade_volume // 100) * 100)
-                            
-                            # 检查可用持股数量是否足够（T+1）
-                            if account['available_shares'] >= trade_volume:
-                                # 计算实际交易金额
-                                current_price = Decimal(str(stock_data['current_price']))
-                                actual_trade_amount = current_price * Decimal(str(trade_volume))
-                                
-                                # 保存交易记录并更新闭环
-                                trade_record = await sync_to_async(create_trade_and_update_loop_sync)(
-                                    self.stock_code,
-                                    'sell',
-                                    stock_data['current_price'],
-                                    trade_volume,
-                                    actual_trade_amount,
-                                    reason
-                                )
-                                
-                                # 更新账户信息
-                                account = await sync_to_async(update_account_after_trade_sync)(
-                                    self.stock_code,
-                                    'sell',
-                                    trade_volume,
-                                    actual_trade_amount
-                                )
-                                
-                                # 重新获取交易设置以获取最新闭环状态
-                                trade_setting = await sync_to_async(get_trade_setting_sync)(self.stock_code)
-                    
-                    # 获取最新的交易记录和闭环记录
-                    trade_records_list = await sync_to_async(get_trade_records_sync)(self.stock_code)
-                    trade_loops_list = await sync_to_async(get_trade_loops_sync)(self.stock_code)
-                    
-                    # 发送股票数据给客户端
-                    await self.send(text_data=json.dumps({
-                        'type': 'stock_data',
-                        'stock_data': stock_data,
-                        'account': {
-                            'balance': float(account['balance']),
-                            'shares': account['shares'],
-                            'available_shares': account['available_shares']
-                        },
-                        'trade_setting': {
-                            'pending_loop_type': trade_setting['pending_loop_type'],
-                            'pending_price': float(trade_setting['pending_price']) if trade_setting['pending_price'] else None,
-                            'pending_volume': trade_setting['pending_volume'],
-                            'pending_timestamp': trade_setting['pending_timestamp'].strftime('%Y-%m-%d %H:%M:%S') if trade_setting['pending_timestamp'] else None,
-                            'overnight_sell_ratio': float(trade_setting['overnight_sell_ratio']),
-                            'overnight_buy_ratio': float(trade_setting['overnight_buy_ratio']),
-                        },
-                        'trade_record': trade_record,
-                        'trade_records': trade_records_list,
-                        'trade_loops': trade_loops_list
-                    }))
-                else:
-                    # 股票数据获取失败，发送错误信息
-                    await self.send(text_data=json.dumps({
-                        'type': 'error',
-                        'message': f'获取股票 {self.stock_code} 数据失败，请检查网络连接或股票代码是否正确',
-                        'stock_code': self.stock_code
-                    }))
-                
-                # 等待一段时间后再次获取数据
-                await asyncio.sleep(5)  # 每5秒获取一次数据
-        except asyncio.CancelledError:
-            # 任务被取消，正常退出
-            pass
+            # 使用自定义 JSON 序列化处理 Decimal 等类型
+            class DecimalEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, Decimal):
+                        return float(obj)
+                    if isinstance(obj, datetime):
+                        return obj.strftime('%Y-%m-%d %H:%M:%S')
+                    return super(DecimalEncoder, self).default(obj)
+
+            payload = json.dumps(event['data'], cls=DecimalEncoder)
+            await self.send(text_data=payload)
         except Exception as e:
-            # 发送错误消息
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'message': str(e)
-            }))
+            print(f"ERROR WS: 序列化或发送数据失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 尝试发送错误消息，但不抛出异常以防止 1011 错误
+            try:
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': f'数据转发失败: {str(e)}'
+                }))
+            except:
+                pass
+
+
