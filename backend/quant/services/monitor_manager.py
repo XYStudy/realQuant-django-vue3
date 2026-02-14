@@ -205,6 +205,14 @@ class MonitorManager:
 
         # 检查闭环一致性：如果当前已有待闭环任务，则当前信号必须是闭环信号
         pending_loop_type = latest_setting.get('pending_loop_type')
+
+        # 下午 14:30 以后禁止新开 T 操作 (交易结束前 30 分钟)
+        now = datetime.now()
+        current_time_str = now.strftime('%H:%M')
+        if not pending_loop_type and current_time_str >= "14:30":
+            print(f"[MONITOR] [{stock_code}] 下午 14:30 以后禁止新开 T 操作 (当前时间: {current_time_str})")
+            return
+
         if pending_loop_type:
             is_valid_closing_trade = False
             if pending_loop_type == 'buy_first' and trade_type == 'sell':

@@ -1,0 +1,6 @@
+{
+    "python.defaultInterpreterPath": "D:\\traeProject\\python_env\\python.exe",
+    "python.analysis.extraPaths": [
+        "D:\\traeProject\\python_env\\Lib\\site-packages"
+    ]
+}

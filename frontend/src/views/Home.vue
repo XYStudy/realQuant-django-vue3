@@ -49,8 +49,8 @@
         <template #header>
           <div class="card-header">
             <span>交易设置</span>
-            <el-tag :type="monitoringTimer ? 'success' : 'danger'" size="small">
-              {{ monitoringTimer ? '监控中' : '未监控' }}
+            <el-tag :type="isMonitoring ? 'success' : 'danger'" size="small">
+              {{ isMonitoring ? '监控中' : '未监控' }}
             </el-tag>
           </div>
         </template>
@@ -510,6 +510,7 @@ const chartData = reactive({
 // WebSocket连接管理
 let ws = null;
 const isWebSocketConnected = ref(false);
+const isMonitoring = ref(false);
 
 // 过滤辅助函数：将 undefined 和空字符串转换为 null，以便后端能够识别并清空数据库字段
 const filterEmptyFields = (obj) => {
@@ -785,6 +786,7 @@ const connectWebSocket = async () => {
       console.log('WebSocket连接已关闭:', event.code, event.reason);
       console.log('关闭事件详情:', event);
       isWebSocketConnected.value = false;
+      isMonitoring.value = false;
       ElMessage.warning(`WebSocket连接已关闭: ${event.code} - ${event.reason}`);
     };
 
@@ -793,6 +795,7 @@ const connectWebSocket = async () => {
       console.error('WebSocket连接错误:', event);
       console.error('错误事件详情:', JSON.stringify(event));
       isWebSocketConnected.value = false;
+      isMonitoring.value = false;
       
       // 获取更详细的错误信息
       let errorMessage = 'WebSocket连接失败';
@@ -855,6 +858,7 @@ const handleWebSocketMessage = (message) => {
       break;
     case 'monitoring_status':
       console.log('监控状态:', message.status);
+      isMonitoring.value = (message.status === 'started');
       break;
     case 'error':
       console.error('WebSocket错误:', message.message);
@@ -914,6 +918,7 @@ const startMonitoring = async () => {
 // 停止监控
 const stopMonitoring = () => {
   console.log('停止监控');
+  isMonitoring.value = false;
   
   // 停止旧的HTTP轮询（如果存在）
   if (monitoringTimer.value) {

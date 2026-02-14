@@ -10,7 +10,7 @@ def send_execution_request(stock_code, action, price, quantity, name):
     """
     向执行端发送交易请求
     """
-    url = "http://172.20.10.6:5000/execute"
+    url = "http://192.168.0.107:5000/execute"
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
     print(f"\n[EXECUTION_DEBUG] [{timestamp}] 开始发送执行请求: {stock_code}({name}), {action}, 价格:{price}, 数量:{quantity}")
     
@@ -247,7 +247,14 @@ class StockDataService:
         """
         计算格子步长（同步前端算法）
         """
-        range_val = high - low
+        try:
+            # 转换为 float 进行计算，避免 Decimal 和 float 混合运算错误
+            h = float(high)
+            l = float(low)
+            range_val = h - l
+        except (TypeError, ValueError):
+            return 0.01
+            
         if range_val <= 0:
             return 0.01
 
@@ -534,9 +541,9 @@ class StockDataService:
             if raw_range_buy_minus is not None or raw_range_buy_plus is not None:
                 # 按均价线区间买入
                 # 逻辑：
-                # 1. 如果设置了 minus，则下限为 avg - minus*step；否则下限为 0 (即不限制下限)
-                # 2. 如果设置了 plus，则上限为 avg + plus*step；否则上限为 avg (即默认不往上方延伸)
-                lower_bound_b = Decimal('0')
+                # 1. 如果设置了 minus，则下限为 avg - minus*step；否则下限为 avg
+                # 2. 如果设置了 plus，则上限为 avg + plus*step；否则上限为 avg
+                lower_bound_b = average_price
                 upper_bound_b = average_price
                 
                 if raw_range_buy_minus is not None:
@@ -551,7 +558,7 @@ class StockDataService:
                 tolerance = Decimal('0.0001')
                 if (lower_bound_b - tolerance) <= current_price <= (upper_bound_b + tolerance):
                     is_buy_signal = True
-                    buy_reason = f"均价线区间买入触发：当前价 {current_price} 在范围 [{lower_bound_b:.4f}, {upper_bound_b if upper_bound_b != Decimal('Infinity') else '∞'}] (格子大小: {step}, 偏离格子数: {grid_diff:.2f})"
+                    buy_reason = f"均价线区间买入触发：当前价 {current_price} 在范围 [{lower_bound_b:.4f}, {upper_bound_b:.4f}] (格子大小: {step}, 偏离格子数: {grid_diff:.2f})"
                 else:
                     # 优化调试日志
                     if current_price < lower_bound_b:
@@ -581,10 +588,10 @@ class StockDataService:
             if raw_range_sell_minus is not None or raw_range_sell_plus is not None:
                 # 按均价线区间卖出
                 # 逻辑：
-                # 1. 如果设置了 minus，则下限为 avg - minus*step；否则下限为 avg (即默认不往下方延伸)
-                # 2. 如果设置了 plus，则上限为 avg + plus*step；否则上限为 Infinity (即不限制上限)
+                # 1. 如果设置了 minus，则下限为 avg - minus*step；否则下限为 avg
+                # 2. 如果设置了 plus，则上限为 avg + plus*step；否则上限为 avg
                 lower_bound_s = average_price
-                upper_bound_s = Decimal('Infinity')
+                upper_bound_s = average_price
                 
                 if raw_range_sell_minus is not None:
                     lower_offset = Decimal(str(raw_range_sell_minus)) * step
@@ -598,7 +605,7 @@ class StockDataService:
                 tolerance = Decimal('0.0001')
                 if (lower_bound_s - tolerance) <= current_price <= (upper_bound_s + tolerance):
                     is_sell_signal = True
-                    sell_reason = f"均价线区间卖出触发：当前价 {current_price} 在范围 [{lower_bound_s:.4f}, {upper_bound_s if upper_bound_s != Decimal('Infinity') else '∞'}] (格子大小: {step}, 偏离格子数: {grid_diff:.2f})"
+                    sell_reason = f"均价线区间卖出触发：当前价 {current_price} 在范围 [{lower_bound_s:.4f}, {upper_bound_s:.4f}] (格子大小: {step}, 偏离格子数: {grid_diff:.2f})"
                 else:
                     if current_price < lower_bound_s:
                         print(f"DEBUG RANGE [SELL] [{stock_data.get('name')}]: 未触发。当前价 {current_price} 低于区间下限 {lower_bound_s:.4f}")
