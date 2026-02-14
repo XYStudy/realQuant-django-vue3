@@ -1,0 +1,12 @@
+# 忽略单个大文件
+large-file.zip
+
+# 忽略整个目录
+node_modules/
+build/
+dist/
+
+# 忽略所有 .log 文件
+*.log
+
+python_env/
