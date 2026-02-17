@@ -27,10 +27,10 @@ file_handler.setFormatter(log_formatter)
 logger.addHandler(file_handler)
 
 # 微信预警配置
-WX_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\wx.png"
-AVATAR_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\avtar.png"
-AVATAR1_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\avtar1.png"
-SEND_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\send.png"
+WX_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\wx.png"
+AVATAR_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\avtar.png"
+AVATAR1_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\avtar1.png"
+SEND_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\send.png"
 
 # 用于存储上次发送过的预警，避免重复发送 (格式: {stock_code_alert_type: last_date})
 SENT_ALERTS = {}
@@ -103,7 +103,8 @@ def send_wechat_message(content):
         logger.error(traceback.format_exc())
 
 # 配置区域
-STOCK_CODES = ['300169','300065','603881','600710','603069','000901','000021','600592','600150','300627','002703','300019','600006','600718','000421']  # 股票代码数组
+# 配置区域
+STOCK_CODES = ['600150']  # 股票代码数组
 EXECUTION_TIMES = ["11:00", "14:00"]  # 执行时间数组
 
 HEADERS = {
@@ -178,12 +179,13 @@ def fetch_historical_prices(stock_code, limit=300):
                 # 获取最后 limit 条数据
                 latest_df = df.tail(limit)
                 
-                # 返回日期和收盘价的列表
+                # 返回日期、收盘价和成交量的列表
                 data = []
                 for index, row in latest_df.iterrows():
                     data.append({
                         "date": str(row['date']),
-                        "close": float(row['close'])
+                        "close": float(row['close']),
+                        "volume": float(row['volume'])
                     })
                 
                 logger.info(f"Successfully fetched {len(data)} historical prices for {stock_code} via AKShare(Sina)")
@@ -238,10 +240,10 @@ def get_stock_name(stock_code):
     return stock_code
 
 def fetch_realtime_price(stock_code, spot_df=None):
-    """获取最新实时股价和名称 (支持多接口重试)"""
+    """获取最新实时股价、名称和成交量 (支持多接口重试)"""
     if not is_trade_day():
         logger.info(f"Today is not a trade day, skipping realtime fetch for {stock_code}")
-        return None, None
+        return None, None, None
 
     clean_code = ''.join(filter(str.isdigit, stock_code))
     
@@ -252,7 +254,8 @@ def fetch_realtime_price(stock_code, spot_df=None):
             if not target.empty:
                 price = float(target.iloc[0]['最新价'])
                 name = target.iloc[0]['名称']
-                return price, name
+                volume = float(target.iloc[0]['成交量'])
+                return price, name, volume
         except Exception as e:
             logger.warning(f"Error extracting data from spot_df for {stock_code}: {e}")
     
@@ -267,16 +270,17 @@ def fetch_realtime_price(stock_code, spot_df=None):
             content = resp.text.split('="')[1]
             if content:
                 parts = content.split(',')
-                if len(parts) > 3:
+                if len(parts) > 8:
                     name = parts[0]
                     price = float(parts[3])
+                    volume = float(parts[8])
                     if price > 0:
-                        logger.info(f"Successfully fetched realtime data for {stock_code} via Sina: {price}")
-                        return price, name
+                        logger.info(f"Successfully fetched realtime data for {stock_code} via Sina: {price}, vol: {volume}")
+                        return price, name, volume
     except Exception as e:
         logger.error(f"Sina HQ failed for {stock_code}: {e}")
 
-    return None, None
+    return None, None, None
 
 def run_analysis(scheduled_time=None):
     """执行分析任务"""
@@ -315,26 +319,31 @@ def run_analysis(scheduled_time=None):
         # 获取股票名称
         stock_name = get_stock_name(code)
             
-        # 获取实时价格 (传入 spot_df)
-        realtime_price, _ = fetch_realtime_price(code, spot_df=spot_df)
+        # 获取实时价格和成交量 (传入 spot_df)
+        realtime_price, _, realtime_vol = fetch_realtime_price(code, spot_df=spot_df)
             
         if realtime_price:
             today_str = now.strftime("%Y-%m-%d")
             if full_data and full_data[-1]['date'].startswith(today_str):
                 full_data[-1]['close'] = realtime_price
+                if realtime_vol:
+                    full_data[-1]['volume'] = realtime_vol
             else:
                 full_data.append({
                     "date": now_str,
-                    "close": realtime_price
+                    "close": realtime_price,
+                    "volume": realtime_vol if realtime_vol else 0
                 })
         
         prices = [item["close"] for item in full_data]
+        volumes = [item.get("volume", 0) for item in full_data]
         ema12 = calculate_ema(prices, 12)
         ema25 = calculate_ema(prices, 25)
         A1 = [ema12[i] - ema25[i] for i in range(len(prices))]
         A2 = calculate_ema(A1, 6)
         
         all_signals = []
+        logger.info(f"--- {stock_name}({code}) Signal Calculation Details (Latest 10 days) ---")
         for i in range(len(full_data)):
             if A1[i] >= 0: main_color = "red" 
             else: main_color = "green" 
@@ -346,6 +355,10 @@ def run_analysis(scheduled_time=None):
                 if A2[i] >= 0: aux_color = "white"
                 else: aux_color = "yellow" 
             all_signals.append((main_color, aux_color))
+            
+            # 打印每天的计算数值和颜色结果
+            print(f"Date: {full_data[i]['date']}, A1: {A1[i]:.4f}, A2: {A2[i]:.4f}, Main: {main_color}, Aux: {aux_color}")
+        logger.info(f"--- End of Signal Details ---")
 
         # 预警逻辑
         if len(all_signals) >= 2:
@@ -358,13 +371,56 @@ def run_analysis(scheduled_time=None):
             
             if prev_main == "red" and prev_aux == "gray" and curr_aux == "white":
                 alert_type = "下降通道"
+                custom_msg = f"{stock_name} {code}，下降通道，请分批逢高减仓"
             elif prev_main == "green" and prev_aux == "yellow" and curr_main == "green" and curr_aux == "gray":
                 alert_type = "下降通道"
+                custom_msg = f"{stock_name} {code}，下降通道，请分批逢高减仓"
             elif prev_main == "green" and prev_aux == "gray" and curr_main == "green" and curr_aux == "yellow":
                 alert_type = "企稳拉升"
+                custom_msg = f"{stock_name} {code}，开始企稳了！请逢低买入或放量突破时买入！"
             elif prev_main == "red" and prev_aux == "white" and curr_main == "red" and curr_aux == "gray":
                 alert_type = "继续拉升"
                 custom_msg = f"{stock_name} {code}, 白点消失，可能继续拉升"
+            
+            # 新增：成交量翻倍且绿柱变窄判断
+            if len(volumes) >= 2 and len(A1) >= 2:
+                prev_vol = volumes[-2]
+                curr_vol = volumes[-1]
+                # 绿色柱体变窄：前后期都是绿柱 (A1 < 0)，且后期值大于前期值 (更接近0)
+                if prev_main == "green" and curr_main == "green" and A1[-1] > A1[-2]:
+                    # 情况1：成交量翻倍
+                    if prev_vol > 0 and curr_vol >= 2 * prev_vol:
+                        alert_type = "急速补仓"
+                        custom_msg = f"{stock_name} {code}, 绿柱变窄，成交量翻倍，极其可能下跌末期，上涨初期，建议急速补仓！"
+                    # 情况2：涨幅大于 6%
+                    elif len(prices) >= 2:
+                        prev_close = prices[-2]
+                        curr_price = prices[-1]
+                        if prev_close > 0:
+                            change_pct = (curr_price - prev_close) / prev_close
+                            if change_pct > 0.06:
+                                alert_type = "强势买入"
+                                custom_msg = f"{stock_name} {code}, 绿柱变窄，股价上涨幅度大于6%，强势买入！"
+                
+                # 红色趋势中白柱变窄：前后期都是红柱 (A1 >= 0)，且后期值大于前期值 (向上拐头/修复)
+                elif prev_main == "red" and curr_main == "red" and curr_aux == "white" and A1[-1] > A1[-2]:
+                    if prev_vol > 0 and curr_vol >= 2 * prev_vol:
+                        alert_type = "急速补仓"
+                        custom_msg = f"{stock_name} {code}, 白柱变窄，成交量翻倍，极其可能反转继续拉升，建议急速补仓！"
+                
+                # 新增：连续三天成交量缩量且 Main: red, Aux: gray 判断
+                if len(all_signals) >= 3 and len(volumes) >= 3:
+                    s3_main, s3_aux = all_signals[-3]
+                    s2_main, s2_aux = all_signals[-2]
+                    s1_main, s1_aux = all_signals[-1]
+                    v3, v2, v1 = volumes[-3], volumes[-2], volumes[-1]
+                    
+                    if (s3_main == "red" and s3_aux == "gray" and
+                        s2_main == "red" and s2_aux == "gray" and
+                        s1_main == "red" and s1_aux == "gray"):
+                        if v1 < v2 < v3:
+                            alert_type = "缩量偏离"
+                            custom_msg = f"{stock_name} {code}，连续三天成交量缩量，请观察5日线，如偏离5日线过多请减仓！"
             
             if alert_type:
                 # 修改去重逻辑：同一个时间点（11:00 或 14:00）只发一次
@@ -398,7 +454,7 @@ def start_scheduler():
     logger.info("Scheduler started.")
     
     # 首次运行一次
-    # run_analysis("Manual")
+    run_analysis("Manual")
 
 
 if __name__ == "__main__":
