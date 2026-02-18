@@ -27,10 +27,10 @@ file_handler.setFormatter(log_formatter)
 logger.addHandler(file_handler)
 
 # 微信预警配置
-WX_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\wx.png"
-AVATAR_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\avtar.png"
-AVATAR1_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\avtar1.png"
-SEND_IMAGE = r"f:\traeProject\backend\quant\services\monitor_images\send.png"
+WX_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\wx.png"
+AVATAR_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\avtar.png"
+AVATAR1_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\avtar1.png"
+SEND_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\send.png"
 
 # 用于存储上次发送过的预警，避免重复发送 (格式: {stock_code_alert_type: last_date})
 SENT_ALERTS = {}
@@ -104,7 +104,7 @@ def send_wechat_message(content):
 
 # 配置区域
 # 配置区域
-STOCK_CODES = ['600150']  # 股票代码数组
+STOCK_CODES = ['300169','300065','603881','600710','603069','000901','000021','600592','600150','300627','002703','300019','600006','600718','000421']  # 股票代码数组
 EXECUTION_TIMES = ["11:00", "14:00"]  # 执行时间数组
 
 HEADERS = {
@@ -184,7 +184,10 @@ def fetch_historical_prices(stock_code, limit=300):
                 for index, row in latest_df.iterrows():
                     data.append({
                         "date": str(row['date']),
+                        "open": float(row['open']),
                         "close": float(row['close']),
+                        "high": float(row['high']),
+                        "low": float(row['low']),
                         "volume": float(row['volume'])
                     })
                 
@@ -243,7 +246,7 @@ def fetch_realtime_price(stock_code, spot_df=None):
     """获取最新实时股价、名称和成交量 (支持多接口重试)"""
     if not is_trade_day():
         logger.info(f"Today is not a trade day, skipping realtime fetch for {stock_code}")
-        return None, None, None
+        return None, None, None, None, None, None
 
     clean_code = ''.join(filter(str.isdigit, stock_code))
     
@@ -255,7 +258,10 @@ def fetch_realtime_price(stock_code, spot_df=None):
                 price = float(target.iloc[0]['最新价'])
                 name = target.iloc[0]['名称']
                 volume = float(target.iloc[0]['成交量'])
-                return price, name, volume
+                open_p = float(target.iloc[0]['今开'])
+                high_p = float(target.iloc[0]['最高'])
+                low_p = float(target.iloc[0]['最低'])
+                return price, name, volume, open_p, high_p, low_p
         except Exception as e:
             logger.warning(f"Error extracting data from spot_df for {stock_code}: {e}")
     
@@ -270,17 +276,99 @@ def fetch_realtime_price(stock_code, spot_df=None):
             content = resp.text.split('="')[1]
             if content:
                 parts = content.split(',')
-                if len(parts) > 8:
+                if len(parts) > 30:
                     name = parts[0]
+                    open_p = float(parts[1])
                     price = float(parts[3])
+                    high_p = float(parts[4])
+                    low_p = float(parts[5])
                     volume = float(parts[8])
                     if price > 0:
                         logger.info(f"Successfully fetched realtime data for {stock_code} via Sina: {price}, vol: {volume}")
-                        return price, name, volume
+                        return price, name, volume, open_p, high_p, low_p
     except Exception as e:
         logger.error(f"Sina HQ failed for {stock_code}: {e}")
 
-    return None, None, None
+    return None, None, None, None, None, None
+
+def check_long_upper_shadow(open_price, high_price, low_price, close_price):
+    """
+    判断当天是否出现长上影线
+    参数:
+        open_price: 开盘价
+        high_price: 最高价
+        low_price: 最低价
+        close_price: 收盘价
+    返回:
+        dict: 包含判断结果和操作提示
+    """
+    
+    # ========== 1. 计算上影线、下影线、实体 ==========
+    if close_price >= open_price:  # 阳线
+        upper_shadow = high_price - close_price
+        lower_shadow = open_price - low_price
+        body = close_price - open_price
+        candle_type = "阳线"
+    else:  # 阴线
+        upper_shadow = high_price - open_price
+        lower_shadow = close_price - low_price
+        body = open_price - close_price
+        candle_type = "阴线"
+    
+    total_range = high_price - low_price
+    
+    # 避免除以0
+    if total_range == 0:
+        return {
+            'is_long_shadow': False,
+            'signal': '无波动',
+            'action': '观望',
+            'reason': '当日无价格波动'
+        }
+    
+    # ========== 2. 计算上影线占比 ==========
+    shadow_ratio = upper_shadow / total_range  # 上影线占整根K线的比例
+    
+    # ========== 3. 判断是否长上影线 ==========
+    # 条件1：上影线占比 ≥ 60%
+    # 条件2：上影线长度 ≥ 实体长度的2倍
+    # 条件3：下影线 < 上影线的50%（可选，增强信号）
+    
+    is_long = (
+        shadow_ratio >= 0.6 and
+        (body == 0 or upper_shadow >= body * 2) and
+        lower_shadow < upper_shadow * 0.5
+    )
+    
+    # ========== 4. 生成信号和提示 ==========
+    if is_long and shadow_ratio >= 0.7:
+        signal = "🔴 强烈长上影"
+        action = "建议卖出/减仓"
+        reason = f"上影线占比{shadow_ratio:.1%}，抛压沉重，短期可能回调"
+    elif is_long and shadow_ratio >= 0.6:
+        signal = "🟠 长上影线"
+        action = "建议逢高减仓"
+        reason = f"上影线占比{shadow_ratio:.1%}，上方遇阻，注意风险"
+    elif shadow_ratio >= 0.5:
+        signal = "🟡 上影线偏长"
+        action = "谨慎持有"
+        reason = f"上影线占比{shadow_ratio:.1%}，有一定压力"
+    else:
+        signal = "🟢 正常K线"
+        action = "正常操作"
+        reason = f"上影线占比{shadow_ratio:.1%}，无明显压力"
+    
+    return {
+        'is_long_shadow': is_long,
+        'candle_type': candle_type,
+        'shadow_ratio': shadow_ratio,
+        'upper_shadow': upper_shadow,
+        'lower_shadow': lower_shadow,
+        'body': body,
+        'signal': signal,
+        'action': action,
+        'reason': reason
+    }
 
 def run_analysis(scheduled_time=None):
     """执行分析任务"""
@@ -320,7 +408,7 @@ def run_analysis(scheduled_time=None):
         stock_name = get_stock_name(code)
             
         # 获取实时价格和成交量 (传入 spot_df)
-        realtime_price, _, realtime_vol = fetch_realtime_price(code, spot_df=spot_df)
+        realtime_price, _, realtime_vol, open_p, high_p, low_p = fetch_realtime_price(code, spot_df=spot_df)
             
         if realtime_price:
             today_str = now.strftime("%Y-%m-%d")
@@ -328,13 +416,42 @@ def run_analysis(scheduled_time=None):
                 full_data[-1]['close'] = realtime_price
                 if realtime_vol:
                     full_data[-1]['volume'] = realtime_vol
+                # 更新 OHLC 数据 (如果获取到)
+                if open_p: full_data[-1]['open'] = open_p
+                if high_p: full_data[-1]['high'] = high_p
+                if low_p: full_data[-1]['low'] = low_p
             else:
                 full_data.append({
                     "date": now_str,
                     "close": realtime_price,
-                    "volume": realtime_vol if realtime_vol else 0
+                    "volume": realtime_vol if realtime_vol else 0,
+                    "open": open_p if open_p else realtime_price, # 缺省用 close
+                    "high": high_p if high_p else realtime_price,
+                    "low": low_p if low_p else realtime_price
                 })
         
+        # 长上影线判断逻辑 (使用 full_data[-1]，兼容历史数据和实时数据)
+        if full_data and len(full_data) > 0:
+            last_candle = full_data[-1]
+            c_open = last_candle.get('open')
+            c_high = last_candle.get('high')
+            c_low = last_candle.get('low')
+            c_close = last_candle.get('close')
+            
+            if c_open and c_high and c_low and c_close:
+                 shadow_result = check_long_upper_shadow(c_open, c_high, c_low, c_close)
+                 if shadow_result['is_long_shadow']:
+                     alert_type = shadow_result['signal']
+                     custom_msg = f"{stock_name} {code}，{shadow_result['signal']}，{shadow_result['action']}，{shadow_result['reason']}"
+                     
+                     # 修改去重逻辑：同一个时间点（11:00 或 14:00）只发一次
+                     alert_key = f"{code}_{alert_type}_{current_window}_{curr_date_only}"
+                     if alert_key not in SENT_ALERTS:
+                        msg = custom_msg
+                        all_alert_messages.append(msg)
+                        SENT_ALERTS[alert_key] = True
+                        logger.info(f"ALERT TRIGGERED for {code}: {msg}")
+
         prices = [item["close"] for item in full_data]
         volumes = [item.get("volume", 0) for item in full_data]
         ema12 = calculate_ema(prices, 12)
@@ -382,6 +499,48 @@ def run_analysis(scheduled_time=None):
                 alert_type = "继续拉升"
                 custom_msg = f"{stock_name} {code}, 白点消失，可能继续拉升"
             
+            # 新增：连续两天/三天/四天白点判断
+            if len(all_signals) >= 4:
+                s4_main, s4_aux = all_signals[-4]
+                s3_main, s3_aux = all_signals[-3]
+                s2_main, s2_aux = all_signals[-2]
+                s1_main, s1_aux = all_signals[-1] # Current
+                
+                # 连续四天逻辑：第一天 Gray，后三天 White (Red + White)
+                if (s4_main == "red" and s4_aux == "gray" and
+                    s3_main == "red" and s3_aux == "white" and
+                    s2_main == "red" and s2_aux == "white" and
+                    s1_main == "red" and s1_aux == "white"):
+                    alert_type = "清仓预警"
+                    custom_msg = f"{stock_name} {code}，下降通道，连续三天出现白点，请及时清仓，等待反转信号"
+                
+                # 连续两天白点 (前天 Gray -> 昨天 White -> 今天 White)
+                elif (s3_main == "red" and s3_aux == "gray" and
+                      s2_main == "red" and s2_aux == "white" and
+                      s1_main == "red" and s1_aux == "white"):
+                    alert_type = "减仓预警"
+                    custom_msg = f"{stock_name} {code}，下降通道，连续两天出现白点，请继续逢高减仓"
+            
+            # 兼容数据不足4天但足3天的情况
+            elif len(all_signals) == 3:
+                s3_main, s3_aux = all_signals[-3]
+                s2_main, s2_aux = all_signals[-2]
+                s1_main, s1_aux = all_signals[-1] # Current
+                 
+                # 连续三天白点 (Red + White)
+                if (s3_main == "red" and s3_aux == "white" and
+                    s2_main == "red" and s2_aux == "white" and
+                    s1_main == "red" and s1_aux == "white"):
+                    alert_type = "清仓预警"
+                    custom_msg = f"{stock_name} {code}，下降通道，连续三天出现白点，请及时清仓，等待反转信号"
+                
+                # 连续两天白点 (前天 Gray -> 昨天 White -> 今天 White)
+                elif (s3_main == "red" and s3_aux == "gray" and
+                      s2_main == "red" and s2_aux == "white" and
+                      s1_main == "red" and s1_aux == "white"):
+                    alert_type = "减仓预警"
+                    custom_msg = f"{stock_name} {code}，下降通道，连续两天出现白点，请继续逢高减仓"
+
             # 新增：成交量翻倍且绿柱变窄判断
             if len(volumes) >= 2 and len(A1) >= 2:
                 prev_vol = volumes[-2]
@@ -392,15 +551,15 @@ def run_analysis(scheduled_time=None):
                     if prev_vol > 0 and curr_vol >= 2 * prev_vol:
                         alert_type = "急速补仓"
                         custom_msg = f"{stock_name} {code}, 绿柱变窄，成交量翻倍，极其可能下跌末期，上涨初期，建议急速补仓！"
-                    # 情况2：涨幅大于 6%
+                    # 情况2：涨幅大于 5%
                     elif len(prices) >= 2:
                         prev_close = prices[-2]
                         curr_price = prices[-1]
                         if prev_close > 0:
                             change_pct = (curr_price - prev_close) / prev_close
-                            if change_pct > 0.06:
+                            if change_pct > 0.05:
                                 alert_type = "强势买入"
-                                custom_msg = f"{stock_name} {code}, 绿柱变窄，股价上涨幅度大于6%，强势买入！"
+                                custom_msg = f"{stock_name} {code}, 绿柱变窄，股价上涨幅度大于5%，强势买入！"
                 
                 # 红色趋势中白柱变窄：前后期都是红柱 (A1 >= 0)，且后期值大于前期值 (向上拐头/修复)
                 elif prev_main == "red" and curr_main == "red" and curr_aux == "white" and A1[-1] > A1[-2]:
