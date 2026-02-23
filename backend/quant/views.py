@@ -298,8 +298,8 @@ def update_trade_setting(request):
             trade_setting, created = TradeSetting.objects.get_or_create(
                 stock_code=stock_code,
                 defaults={
-                    'sell_threshold': safe_decimal(data.get('sell_threshold'), Decimal('0.5')),
-                    'buy_threshold': safe_decimal(data.get('buy_threshold'), Decimal('0.5')),
+                    'sell_threshold': safe_decimal(data.get('sell_threshold')),
+                    'buy_threshold': safe_decimal(data.get('buy_threshold')),
                     'buy_shares': data.get('buy_shares'),
                     'sell_shares': data.get('sell_shares'),
                     'update_interval': data.get('update_interval', 5),
@@ -359,8 +359,8 @@ def update_trade_setting(request):
             'pending_price': float(trade_setting.pending_price) if trade_setting.pending_price else None,
             'pending_volume': trade_setting.pending_volume,
             'pending_timestamp': trade_setting.pending_timestamp.strftime('%Y-%m-%d %H:%M:%S') if trade_setting.pending_timestamp else None,
-            'sell_threshold': float(trade_setting.sell_threshold) if trade_setting.sell_threshold is not None else 0.5,
-            'buy_threshold': float(trade_setting.buy_threshold) if trade_setting.buy_threshold is not None else 0.5,
+            'sell_threshold': float(trade_setting.sell_threshold) if trade_setting.sell_threshold is not None else None,
+            'buy_threshold': float(trade_setting.buy_threshold) if trade_setting.buy_threshold is not None else None,
             'buy_shares': trade_setting.buy_shares,
             'sell_shares': trade_setting.sell_shares,
             'update_interval': trade_setting.update_interval,

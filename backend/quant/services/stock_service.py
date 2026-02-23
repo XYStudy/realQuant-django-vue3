@@ -6,6 +6,8 @@ import os
 import json
 from decimal import Decimal
 
+STRATEGY_CALL_COUNT = 0
+
 def send_execution_request(stock_code, action, price, quantity, name):
     """
     向执行端发送交易请求
@@ -307,7 +309,7 @@ class StockDataService:
             try:
                 pending_price_dec = Decimal(str(pending_price))
             except:
-                return False, None, f"无效的待处理价格: {pending_price}"
+                return False, None, f"无效的待处理价格: {pending_price}", None
             # 检查是否为隔夜
             is_overnight = False
             if pending_timestamp:
@@ -334,7 +336,7 @@ class StockDataService:
                     # 隔夜卖出比例
                     threshold_price = pending_price_dec * (1 + Decimal(str(overnight_sell_ratio)) / 100)
                     if current_price >= threshold_price:
-                        return True, 'sell', f'隔夜闭环：当前价 {current_price} >= 目标价 {threshold_price:.2f} (买入价 {pending_price_dec} + {overnight_sell_ratio}%)'
+                        return True, 'sell', f'隔夜闭环：当前价 {current_price} >= 目标价 {threshold_price:.2f} (买入价 {pending_price_dec} + {overnight_sell_ratio}%)', None
                 
                 # 2. 如果隔夜未达标，或者不是隔夜，则检查常规策略信号
                 if isinstance(setting, dict):
@@ -348,7 +350,7 @@ class StockDataService:
                 setting_copy['buy_avg_line_range_plus'] = None
                 setting_copy['buy_threshold'] = 999  # 极大值屏蔽百分比买入
                 
-                should_trade, trade_type, reason = StockDataService._check_strategy_signal(stock_data, setting_copy)
+                should_trade, trade_type, reason, extra_info = StockDataService._check_strategy_signal(stock_data, setting_copy)
                 
                 # 同步格子信息到外部 stock_data
                 if 'grid_step' in stock_data:
@@ -364,7 +366,7 @@ class StockDataService:
                     actual_reason = reason
                     if trade_type == 'both' and "卖: " in reason:
                         actual_reason = reason.split("卖: ")[1]
-                    return True, 'sell', actual_reason
+                    return True, 'sell', actual_reason, extra_info
             
             elif pending_loop_type == 'sell_first':
                 # 待买入：此时应屏蔽卖出条件，只监控买入条件
@@ -374,7 +376,7 @@ class StockDataService:
                     # 隔夜买入比例
                     threshold_price = pending_price_dec * (1 - Decimal(str(overnight_buy_ratio)) / 100)
                     if current_price <= threshold_price:
-                        return True, 'buy', f'隔夜闭环：当前价 {current_price} <= 目标价 {threshold_price:.2f} (卖出价 {pending_price_dec} - {overnight_buy_ratio}%)'
+                        return True, 'buy', f'隔夜闭环：当前价 {current_price} <= 目标价 {threshold_price:.2f} (卖出价 {pending_price_dec} - {overnight_buy_ratio}%)', None
                 
                 # 2. 如果隔夜未达标，或者不是隔夜，则检查常规策略信号
                 if isinstance(setting, dict):
@@ -388,7 +390,7 @@ class StockDataService:
                 setting_copy['sell_avg_line_range_plus'] = None
                 setting_copy['sell_threshold'] = 999  # 极大值屏蔽百分比卖出
                 
-                should_trade, trade_type, reason = StockDataService._check_strategy_signal(stock_data, setting_copy)
+                should_trade, trade_type, reason, extra_info = StockDataService._check_strategy_signal(stock_data, setting_copy)
                 
                 # 增加调试日志
                 if not should_trade:
@@ -398,13 +400,13 @@ class StockDataService:
                     actual_reason = reason
                     if trade_type == 'both' and "买: " in reason:
                         actual_reason = reason.split("买: ")[1].split(" |")[0]
-                    return True, 'buy', actual_reason
+                    return True, 'buy', actual_reason, extra_info
             
             # 如果有闭环要求但未触发，则不进行任何新交易
-            return False, None, None
+            return False, None, None, None
 
         # 2. 没有未完成闭环，按照策略查找新交易
-        should_trade, trade_type, reason = StockDataService._check_strategy_signal(stock_data, setting)
+        should_trade, trade_type, reason, extra_info = StockDataService._check_strategy_signal(stock_data, setting)
         
         # 增加调试日志
         if not should_trade:
@@ -439,14 +441,14 @@ class StockDataService:
             # 限制：低位震荡只能先买后卖 (不能作为第一笔卖出)
             if oscillation_type == 'low' and trade_type == 'sell':
                 print(f"DEBUG: 低位震荡限制，拦截 {stock_data.get('name')} 的第一笔卖出交易 (原因: {reason})")
-                return False, None, f"低位震荡限制: {reason}"
+                return False, None, f"低位震荡限制: {reason}", extra_info
             
             # 限制：高位震荡只能先卖后买 (不能作为第一笔买入)
             if oscillation_type == 'high' and trade_type == 'buy':
                 print(f"DEBUG: 高位震荡限制，拦截 {stock_data.get('name')} 的第一笔买入交易 (原因: {reason})")
-                return False, None, f"高位震荡限制: {reason}"
+                return False, None, f"高位震荡限制: {reason}", extra_info
                 
-        return should_trade, trade_type, reason
+        return should_trade, trade_type, reason, extra_info
 
     @staticmethod
     def _check_strategy_signal(stock_data, setting):
@@ -471,6 +473,35 @@ class StockDataService:
             return val
 
         strategy = get_val(setting, 'strategy', 'percentage')
+        
+        # 多因子策略处理
+        if strategy == 'multi_factor':
+            try:
+                from quant.services.multi_factor_strategy import MultiFactorStrategy
+                stock_code = stock_data.get('stock_code')
+                if stock_code:
+                    strategy_instance = MultiFactorStrategy.get_instance(stock_code)
+                    
+                    # 调用前
+                    global STRATEGY_CALL_COUNT
+                    STRATEGY_CALL_COUNT += 1
+                    print(f"\n[TEST] ========== 第{STRATEGY_CALL_COUNT}次调用 ==========")
+                    print(f"[TEST] 当前时间：{datetime.now()}")
+
+                    # 调用
+                    result = strategy_instance.check_signal(stock_data, setting)
+                    
+                    # 调用后
+                    print(f"[TEST] 返回结果：{result}")
+                    print(f"[TEST] ========== 调用结束 ==========\n")
+                    
+                    return result
+            except Exception as e:
+                print(f"多因子策略出错: {e}")
+                import traceback
+                traceback.print_exc()
+                return False, None, f"多因子策略出错: {e}", None
+
         market_stage = get_val(setting, 'market_stage', 'oscillation')
         
         try:
@@ -478,11 +509,11 @@ class StockDataService:
             average_price = Decimal(str(stock_data['average_price']))
         except Exception as e:
             print(f"Decimal 转换失败 (stock_data): {e}")
-            return False, None, None
+            return False, None, None, None
         
         # 目前只处理震荡阶段
         if market_stage != 'oscillation':
-            return False, None, None
+            return False, None, None, None
 
         potential_trade_type = None
         reason = ""
@@ -627,14 +658,14 @@ class StockDataService:
         # 返回结果：如果同时有买卖信号，返回一个包含两者的元组
         # 这里的 trade_type 可以是 'buy', 'sell' 或 'both'
         if is_buy_signal and is_sell_signal:
-            return True, 'both', f"同时触发买卖信号 | 买: {buy_reason} | 卖: {sell_reason}"
+            return True, 'both', f"同时触发买卖信号 | 买: {buy_reason} | 卖: {sell_reason}", None
         
         if is_buy_signal:
-            return True, 'buy', buy_reason
+            return True, 'buy', buy_reason, None
             
         if is_sell_signal:
-            return True, 'sell', sell_reason
+            return True, 'sell', sell_reason, None
 
-        return False, None, None
+        return False, None, None, None
 
 

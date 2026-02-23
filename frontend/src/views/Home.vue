@@ -12,6 +12,59 @@
     </el-dialog>
 
     <div class="control-panel">
+      <el-card class="mt-10" v-if="tradeSettings.strategy === 'multi_factor' && isMonitoring">
+        <template #header>
+          <div class="card-header">
+            <span>多因子策略状态</span>
+            <el-tag :type="strategyInfo.isWeakMarket ? 'danger' : 'success'" size="small">
+              {{ strategyInfo.isWeakMarket ? '弱势市场' : '强势市场' }}
+            </el-tag>
+          </div>
+        </template>
+        <div class="realtime-data">
+          <el-row :gutter="20">
+            <el-col :span="8">
+              <div class="data-item">
+                <div class="data-label">当前评分</div>
+                <div class="data-value" :class="strategyInfo.score >= strategyInfo.threshold ? 'price-up' : ''">
+                  {{ strategyInfo.score !== null ? strategyInfo.score : '--' }}
+                </div>
+              </div>
+            </el-col>
+            <el-col :span="8">
+              <div class="data-item">
+                <div class="data-label">买入阈值</div>
+                <div class="data-value">{{ strategyInfo.threshold !== null ? strategyInfo.threshold : '--' }}</div>
+              </div>
+            </el-col>
+            <el-col :span="8">
+              <div class="data-item">
+                <div class="data-label">市场状态</div>
+                <div class="data-value" style="font-size: 14px;">{{ strategyInfo.marketReason || '--' }}</div>
+              </div>
+            </el-col>
+          </el-row>
+          <el-row :gutter="20" class="mt-10" v-if="strategyInfo.profitPct !== undefined && strategyInfo.profitPct !== null">
+            <el-col :span="12">
+              <div class="data-item">
+                <div class="data-label">当前收益</div>
+                <div class="data-value" :class="strategyInfo.profitPct > 0 ? 'price-up' : 'price-down'">
+                  {{ (strategyInfo.profitPct * 100).toFixed(2) }}%
+                </div>
+              </div>
+            </el-col>
+            <el-col :span="12">
+              <div class="data-item">
+                <div class="data-label">止盈目标</div>
+                <div class="data-value">
+                  {{ strategyInfo.targetProfit ? (strategyInfo.targetProfit * 100).toFixed(2) + '%' : '--' }}
+                </div>
+              </div>
+            </el-col>
+          </el-row>
+        </div>
+      </el-card>
+
       <el-card class="mt-10">
         <template #header>
           <div class="card-header">
@@ -105,6 +158,7 @@
                 <el-select v-model="tradeSettings.strategy" placeholder="请选择策略" style="width: 300px">
                   <el-option label="格子法做T" value="grid" v-if="tradeSettings.marketStage === 'oscillation'" />
                   <el-option label="百分比做T" value="percentage" v-if="tradeSettings.marketStage === 'oscillation'" />
+                  <el-option label="多因子做T" value="multi_factor" v-if="tradeSettings.marketStage === 'oscillation'" />
                 </el-select>
               </el-form-item>
             </el-col>
@@ -462,7 +516,7 @@ const tradeSettings = reactive({
   buyThreshold: 0.5,
   marketStage: 'oscillation', // 'oscillation', 'downward', 'upward'
   oscillationType: 'normal', // 'low', 'normal'
-  strategy: 'grid', // 'grid', 'percentage'
+  strategy: 'multi_factor', // 'grid', 'percentage', 'multi_factor'
   gridBuyCount: null,
   gridSellCount: null,
   buyAvgLineRangeMinus: null,
@@ -493,6 +547,16 @@ const pendingLoop = reactive({
   timestamp: null,
   overnightRatio: 1.0
 });
+
+const strategyInfo = reactive({
+  score: null,
+  threshold: null,
+  marketReason: '',
+  isWeakMarket: false,
+  profitPct: null,
+  targetProfit: null
+});
+
 const clearDialogVisible = ref(false);
 const monitoringTimer = ref(null);
 const accountSettings = reactive({
@@ -707,7 +771,7 @@ const connectWebSocket = async () => {
     await fetchAccountSettings();
     
     // 保存交易设置到后端
-    const tradeSettingData = filterEmptyFields({
+    const payload = {
       stock_code: tradeSettings.stockCode,
       sell_threshold: tradeSettings.sellThreshold,
       buy_threshold: tradeSettings.buyThreshold,
@@ -723,7 +787,17 @@ const connectWebSocket = async () => {
       strategy: tradeSettings.strategy,
       grid_buy_count: tradeSettings.gridBuyCount,
       grid_sell_count: tradeSettings.gridSellCount,
-    });
+    };
+
+    // 如果是多因子做T策略，将相关参数置为null
+    if (tradeSettings.strategy === 'multi_factor') {
+      payload.grid_buy_count = null;
+      payload.grid_sell_count = null;
+      payload.buy_threshold = null;
+      payload.sell_threshold = null;
+    }
+
+    const tradeSettingData = filterEmptyFields(payload);
     
     await axios.post('/api/trade-setting/', tradeSettingData);
 
@@ -827,6 +901,17 @@ const handleWebSocketMessage = (message) => {
       realtimeData.highPrice = message.stock_data.high || message.stock_data.current_price;
       realtimeData.lowPrice = message.stock_data.low || message.stock_data.current_price;
       
+      // 更新策略信息
+      if (message.stock_data.strategy_info) {
+        const info = message.stock_data.strategy_info;
+        strategyInfo.score = info.score;
+        strategyInfo.threshold = info.threshold;
+        strategyInfo.marketReason = info.market_reason;
+        strategyInfo.isWeakMarket = info.is_weak_market;
+        strategyInfo.profitPct = info.profit_pct;
+        strategyInfo.targetProfit = info.target_profit;
+      }
+
       // 更新账户信息
       if (message.account) {
         accountSettings.balance = message.account.balance;

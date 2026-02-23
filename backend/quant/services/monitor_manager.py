@@ -110,9 +110,8 @@ class MonitorManager:
                         if stock_data.get('name'):
                             stock_name = stock_data['name']
 
-                        # 3. 只有在激活状态下才检查交易逻辑
-                        if is_active:
-                            await self._process_trade_logic(stock_code, stock_data, trade_setting)
+                        # 3. 检查交易逻辑 (无论是否激活，都运行策略以获取分析数据)
+                        await self._process_trade_logic(stock_code, stock_data, trade_setting)
                         
                         # 4. 获取账户和记录信息
                         account = await self._get_account(stock_code)
@@ -182,10 +181,22 @@ class MonitorManager:
             return
 
         # 2. 检查交易信号
-        should_trade, trade_type, reason = await sync_to_async(StockDataService.check_trade_condition)(
+        should_trade, trade_type, reason, extra_info = await sync_to_async(StockDataService.check_trade_condition)(
             stock_data, 
             trade_setting
         )
+
+        # 将 extra_info 注入到 stock_data 中，以便广播到前端
+        if extra_info:
+            stock_data['strategy_info'] = extra_info
+
+        # 检查是否激活交易，未激活仅分析不执行
+        is_active = trade_setting.get('is_active', False)
+        if not is_active:
+            # 仅当策略有信号且未激活时打印提示
+            if should_trade:
+                print(f"[MONITOR] [{stock_code}] 策略触发信号 ({trade_type}) 但自动交易未激活，仅作记录")
+            return
 
         if not should_trade:
             # 只有当原因不为 None 时才打印，避免刷屏

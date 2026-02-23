@@ -78,6 +78,7 @@ class TradeSetting(models.Model):
     STRATEGY_CHOICES = (
         ('grid', '格子法做T'),
         ('percentage', '百分比做T'),
+        ('multi_factor', '多因子做T'),
     )
 
     OSCILLATION_TYPE_CHOICES = (
@@ -88,11 +89,11 @@ class TradeSetting(models.Model):
     stock_code = models.CharField(max_length=10, unique=True, verbose_name='股票代码')
     market_stage = models.CharField(max_length=20, choices=STAGE_CHOICES, null=True, blank=True, verbose_name='行情阶段')
     oscillation_type = models.CharField(max_length=20, choices=OSCILLATION_TYPE_CHOICES, null=True, blank=True, verbose_name='震荡类型')
-    strategy = models.CharField(max_length=20, choices=STRATEGY_CHOICES, default='grid', verbose_name='交易策略')
+    strategy = models.CharField(max_length=20, choices=STRATEGY_CHOICES, default='multi_factor', verbose_name='交易策略')
     
     # 百分比策略字段
-    sell_threshold = models.DecimalField(max_digits=5, decimal_places=2, default=0.5, verbose_name='高于均价卖出阈值(%)')
-    buy_threshold = models.DecimalField(max_digits=5, decimal_places=2, default=0.5, verbose_name='低于均价买入阈值(%)')
+    sell_threshold = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, default=0.5, verbose_name='高于均价卖出阈值(%)')
+    buy_threshold = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, default=0.5, verbose_name='低于均价买入阈值(%)')
     
     # 均价线买入区间字段
     buy_avg_line_range_minus = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, verbose_name='均价线买入左区间(-)')

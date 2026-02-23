@@ -27,10 +27,13 @@ file_handler.setFormatter(log_formatter)
 logger.addHandler(file_handler)
 
 # 微信预警配置
-WX_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\wx.png"
-AVATAR_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\avtar.png"
-AVATAR1_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\avtar1.png"
-SEND_IMAGE = r"d:\traeProject\backend\quant\services\monitor_images\send.png"
+current_dir = os.path.dirname(os.path.abspath(__file__))
+image_dir = os.path.join(current_dir, "monitor_images")
+
+WX_IMAGE = os.path.join(image_dir, "wx.png")
+AVATAR_IMAGE = os.path.join(image_dir, "avtar.png")
+AVATAR1_IMAGE = os.path.join(image_dir, "avtar1.png")
+SEND_IMAGE = os.path.join(image_dir, "send.png")
 
 # 用于存储上次发送过的预警，避免重复发送 (格式: {stock_code_alert_type: last_date})
 SENT_ALERTS = {}
