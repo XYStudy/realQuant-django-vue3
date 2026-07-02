@@ -33,10 +33,75 @@ image_dir = os.path.join(current_dir, "monitor_images")
 WX_IMAGE = os.path.join(image_dir, "wx.png")
 AVATAR_IMAGE = os.path.join(image_dir, "avtar.png")
 AVATAR1_IMAGE = os.path.join(image_dir, "avtar1.png")
+AVATAR2_IMAGE = os.path.join(image_dir, "avtar2.png")
+MSG_FAIL_IMAGE = os.path.join(image_dir, "messageFail.png")
 SEND_IMAGE = os.path.join(image_dir, "send.png")
+SEND2_IMAGE = os.path.join(image_dir, "send2.png")
 
 # 用于存储上次发送过的预警，避免重复发送 (格式: {stock_code_alert_type: last_date})
 SENT_ALERTS = {}
+
+def _safe_locate_center_on_screen(img_path, confidence=0.8):
+    """找图前先校验文件存在，避免因缺图直接抛异常中断流程。"""
+    if not os.path.exists(img_path):
+        logger.warning(f"Image file not found, skipping locate: {img_path}")
+        return None
+
+    try:
+        return pyautogui.locateCenterOnScreen(img_path, confidence=confidence)
+    except Exception as e:
+        logger.warning(f"Locate image failed for {img_path}: {type(e).__name__}: {e}")
+        return None
+
+def _focus_input_above_send(send_pos, offset_y=20):
+    """点击发送按钮上方一点的位置，尽量让聊天输入框获得焦点。"""
+    focus_x = int(send_pos.x)
+    focus_y = max(int(send_pos.y) - offset_y, 0)
+    pyautogui.click(focus_x, focus_y)
+    time.sleep(0.5)
+
+def _find_send_indicator(timeout=3.0, step=0.4):
+    """在短时间内重复查找发送区标识，优先返回 send2。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        send2_pos = _safe_locate_center_on_screen(SEND2_IMAGE, confidence=0.8)
+        if send2_pos:
+            return "send2", send2_pos
+
+        send_pos = _safe_locate_center_on_screen(SEND_IMAGE, confidence=0.8)
+        if send_pos:
+            return "send", send_pos
+
+        time.sleep(step)
+
+    return None, None
+
+def _ensure_chat_input_focused(ax, ay):
+    """尽量确保聊天输入框已聚焦，再执行粘贴发送。"""
+    indicator_type, indicator_pos = _find_send_indicator(timeout=2.0)
+    if indicator_type == "send2":
+        logger.info(f"Found send2 indicator at {indicator_pos}, clicking 20px above it to focus input box...")
+        _focus_input_above_send(indicator_pos, offset_y=20)
+        return True
+    if indicator_type == "send":
+        logger.info(f"Found send indicator at {indicator_pos}, proceeding to send.")
+        return True
+
+    logger.info("Send indicators not found on first pass, clicking avatar once and retrying focus...")
+    pyautogui.click(ax, ay)
+    time.sleep(1.0)
+
+    indicator_type, indicator_pos = _find_send_indicator(timeout=2.5)
+    if indicator_type == "send2":
+        logger.info(f"Found send2 indicator after retry at {indicator_pos}, clicking 20px above it to focus input box...")
+        _focus_input_above_send(indicator_pos, offset_y=20)
+        return True
+    if indicator_type == "send":
+        logger.info(f"Found send indicator after retry at {indicator_pos}, proceeding to send.")
+        return True
+
+    logger.warning("Send indicators still not found after retry; sending may not land in the intended input box.")
+    return False
 
 def send_wechat_message(content):
     """通过 pyautogui 模拟微信发送消息给多个联系人"""
@@ -44,16 +109,23 @@ def send_wechat_message(content):
         return
     
     # 定义需要发送的联系人头像列表
-    target_avatars = [AVATAR_IMAGE, AVATAR1_IMAGE]
+    target_avatars = [avatar for avatar in [AVATAR_IMAGE, AVATAR1_IMAGE, AVATAR2_IMAGE] if os.path.exists(avatar)]
     
     try:
         logger.info(f"Attempting to send WeChat message to {len(target_avatars)} targets")
         
-        # 1. 点击微信图标 (尝试激活窗口)
-        wx_pos = pyautogui.locateCenterOnScreen(WX_IMAGE, confidence=0.8)
+        # 1. 点击微信图标 (优先 wx.png，找不到则回退到 wx2.png)
+        wx_pos = None
+        wx_image_used = None
+        for wx_image in [WX_IMAGE]:
+            wx_pos = _safe_locate_center_on_screen(wx_image, confidence=0.8)
+            if wx_pos:
+                wx_image_used = wx_image
+                break
+
         if wx_pos:
             x, y = int(wx_pos.x), int(wx_pos.y)
-            logger.info(f"Found WeChat icon at ({x}, {y})")
+            logger.info(f"Found WeChat icon via {os.path.basename(wx_image_used)} at ({x}, {y})")
             pyautogui.click(x, y)
             time.sleep(1)
         else:
@@ -64,37 +136,57 @@ def send_wechat_message(content):
             logger.info(f"Sending to avatar: {os.path.basename(avatar_path)}")
             
             # 2. 点击头像/联系人
-            avatar_pos = pyautogui.locateCenterOnScreen(avatar_path, confidence=0.8)
+            avatar_pos = _safe_locate_center_on_screen(avatar_path, confidence=0.8)
+            if not avatar_pos and wx_pos:
+                logger.info(f"{os.path.basename(avatar_path)} not found after WeChat activation, clicking {os.path.basename(wx_image_used)} once more and retrying...")
+                pyautogui.click(x, y)
+                time.sleep(1)
+                avatar_pos = _safe_locate_center_on_screen(avatar_path, confidence=0.8)
+
             if avatar_pos:
                 ax, ay = int(avatar_pos.x), int(avatar_pos.y)
                 logger.info(f"Found Avatar at ({ax}, {ay})")
-                # 点击头像选择联系人
                 pyautogui.click(ax, ay)
                 time.sleep(1)
                 
-                # 检查是否能找到发送按钮/发送区域标识
-                send_pos = pyautogui.locateCenterOnScreen(SEND_IMAGE, confidence=0.8)
-                if send_pos:
-                    logger.info(f"Found send indicator at {send_pos}, proceeding to send.")
-                else:
-                    logger.info("Send indicator not found, clicking avatar again to focus input box...")
-                    pyautogui.click(ax, ay)
-                    time.sleep(0.5)
+                # 先尽量确认输入框已聚焦，避免后续粘贴落到错误位置。
+                input_focused = _ensure_chat_input_focused(ax, ay)
                 
                 # 3. 粘贴内容并发送
-                pyperclip.copy(content)
-                time.sleep(0.5)
-                # 确保输入框干净
-                pyautogui.hotkey('ctrl', 'a')
-                time.sleep(0.3)
-                pyautogui.press('backspace')
-                time.sleep(0.3)
-                # 粘贴
-                pyautogui.hotkey('ctrl', 'v')
-                time.sleep(1)
-                # 发送
-                pyautogui.press('enter')
-                logger.info(f"Message sent to {os.path.basename(avatar_path)} successfully")
+                def _do_paste_and_send():
+                    pyperclip.copy(content)
+                    time.sleep(0.5)
+                    # 确保输入框干净
+                    pyautogui.hotkey('ctrl', 'a')
+                    time.sleep(0.3)
+                    pyautogui.press('backspace')
+                    time.sleep(0.3)
+                    # 粘贴
+                    pyautogui.hotkey('ctrl', 'v')
+                    time.sleep(1)
+                    # 发送
+                    pyautogui.press('enter')
+                
+                _do_paste_and_send()
+                
+                # 检查是否发送失败 (出现了 messageFail.png)
+                time.sleep(2)
+                fail_pos = _safe_locate_center_on_screen(MSG_FAIL_IMAGE, confidence=0.8)
+                if fail_pos:
+                    logger.warning(f"Message send failed (found {os.path.basename(MSG_FAIL_IMAGE)}), clicking to clear and retrying...")
+                    pyautogui.click(int(fail_pos.x), int(fail_pos.y))
+                    time.sleep(1)
+                    # 再次点击头像确保焦点
+                    pyautogui.click(ax, ay)
+                    time.sleep(0.5)
+                    # 重试发送
+                    _do_paste_and_send()
+                    logger.info(f"Retry attempt finished for {os.path.basename(avatar_path)}")
+                
+                if input_focused:
+                    logger.info(f"Send action completed for {os.path.basename(avatar_path)}")
+                else:
+                    logger.warning(f"Send action completed for {os.path.basename(avatar_path)}, but input focus was not confirmed")
                 time.sleep(1) # 两个联系人之间稍作停顿
             else:
                 logger.error(f"Could not find Avatar icon on screen using {avatar_path}")

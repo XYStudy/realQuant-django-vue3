@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skills": {
+    "find-skills": {
+      "source": "vercel-labs/skills",
+      "sourceType": "github",
+      "computedHash": "645b891da1edbae76ab79c7b088d4e73397464f8396edaf773c0e01971ce75d6"
+    },
+    "multi-search-engine": {
+      "source": "aaaaqwq/claude-code-skills",
+      "sourceType": "github",
+      "computedHash": "956ffe58dcc1447d0f07ba11bf8edb2319b680454eb52ac49296aea528eb72b4"
+    },
+    "stock-research-engine": {
+      "source": "d:\\traeProject\\_skills_sources\\stock-research-engine",
+      "sourceType": "local",
+      "computedHash": "3e28ee18f8831d4e33f2b64f329d562e767f244b765c7ba33c2cb11aaa1129bf"
+    },
+    "tavily-search": {
+      "source": "d:\\traeProject\\.agents\\skills\\openclaw-tavily-search",
+      "sourceType": "local",
+      "computedHash": "7548da5788d4a954880d088ff580f777b7cb3da6673e8bb872bb12bc22815cbb"
+    }
+  }
+}

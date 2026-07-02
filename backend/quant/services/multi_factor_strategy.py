@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     'local_file_pattern': '{code}.XSHG_5min_{start}_{end}.csv',  # 📄 本地文件命名模板
     
     # ========== 大盘过滤配置 ==========
-    'market_filter_enable': True,       # 🛡️ 是否启用大盘过滤（True=启用，False=跳过大盘判断）
+    'market_filter_enable': False,       # 🛡️ 是否启用大盘过滤（True=启用，False=跳过大盘判断）
     'market_code': '000001',            # 📊 大盘指数代码（000001=上证指数，399001=深证成指）
     
     # ========== 策略核心参数 ==========
@@ -616,6 +616,7 @@ class MarketFilter:
         elif score >= -0.2: return 'weak', score
         else: return 'danger', score
     
+    
     def check(self, market_df, current_time, stock_is_weak):
         """
         大盘过滤检查（早盘优化版）
@@ -652,7 +653,7 @@ class MarketFilter:
         
         else:  # strong
             return True, 0.50, f"🟢 大盘强势 (评分={score:.2f})"
-
+    
 
 # ==================== V5.6 评分系统 ====================
 class V56Scorer:
@@ -830,6 +831,12 @@ class MultiFactorStrategy:
             current_data = processed_df.iloc[-1]
             
             score = self.scorer.calculate_total(current_data)
+            vwap_score = self.scorer.score_vwap(current_data)
+            intraday_pos_score = self.scorer.score_intraday_position(current_data)
+            vwap_change_score = self.scorer.score_vwap_change(current_data)
+            trend_score = self.scorer.score_trend(current_data)
+            rsi_score = self.scorer.score_rsi(current_data)
+            volume_score = self.scorer.score_volume(current_data)
             
             # ⭐ 核心优化：每次检查信号时更新大盘数据
             if self.config.get('market_filter_enable', True):
@@ -854,7 +861,15 @@ class MultiFactorStrategy:
                 'score': round(float(score), 2),
                 'threshold': round(float(threshold), 2),
                 'market_reason': market_reason,
-                'is_weak_market': bool(current_data.get('is_weak_market', False))
+                'is_weak_market': bool(current_data.get('is_weak_market', False)),
+                'factor_scores': {
+                    'vwap': round(float(vwap_score), 3),
+                    'intraday_pos': round(float(intraday_pos_score), 3),
+                    'vwap_change': round(float(vwap_change_score), 3),
+                    'trend': round(float(trend_score), 3),
+                    'rsi': round(float(rsi_score), 3),
+                    'volume': round(float(volume_score), 3),
+                }
             }
             
             print(f"[MultiFactor] {self.stock_code} Score: {score:.2f} Threshold: {threshold} Reason: {market_reason} Allow: {allow_trade}")
@@ -869,6 +884,7 @@ class MultiFactorStrategy:
                     return True, 'buy', f"多因子评分买入 (Score={score:.2f})", extra_info
                 else:
                     print(f"[MultiFactor] 分数不足：{score:.2f} < {threshold}")
+                    print(f"[MultiFactor] 评分明细：vwap={vwap_score:.3f}, intraday={intraday_pos_score:.3f}, vwap_chg={vwap_change_score:.3f}, trend={trend_score:.3f}, rsi={rsi_score:.3f}, volume={volume_score:.3f} -> total={score:.3f}")
                     return False, None, f"分数不足 (Score={score:.2f})", extra_info
             
             elif pending_loop_type == 'buy_first':
