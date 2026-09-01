@@ -1,0 +1,67 @@
+backend/quant/services/monitor_oil.py
+  s_0156e4c6f300f9::t_36cc65e18a0731 357-377
+  s_0156e4c6f300f9::t_bdf9774ab0d1b0 146,217,224,279,291,319,488-526,528-548,556,588,711,734,738,1143,1192,1247
+  s_0156e4c6f300f9::t_df275743887c2a 527
+  s_0156e4c6f300f9::t_4da09222d703eb 379-485,1099,1285
+  s_0156e4c6f300f9::t_9345002ef702e3 1185
+  s_0156e4c6f300f9::t_042acd627f9b43 356
+  s_0156e4c6f300f9::t_1de0c91cb1c316 856-868
+  s_0156e4c6f300f9::t_0c8a1a96a0c0d3 802-836
+  s_0156e4c6f300f9::t_141a43d51be353 143-145
+  s_0156e4c6f300f9::t_b89a56c0f91df4 147-149,214-216
+  s_0156e4c6f300f9::t_1f8a03800f6d82 218-223
+  s_0156e4c6f300f9::t_ecb81a608109cd 225-227,276-278
+  s_0156e4c6f300f9::t_699ccf8e37e13e 280-282,288-290
+  s_0156e4c6f300f9::t_3a72cda2939612 292-294,316-318
+  s_0156e4c6f300f9::t_3acc0d5336afc9 320-322,353-355
+  s_0156e4c6f300f9::t_fe8b391b05f599 378
+  s_0156e4c6f300f9::t_b051ff9f1b808f 486-487
+  s_0156e4c6f300f9::t_d1f24fdb51dbab 549-551,553-555
+  s_0156e4c6f300f9::t_9c70665118e34d 557-559,585-587
+  s_0156e4c6f300f9::t_c99b3f24223828 589-591,708-710
+  s_0156e4c6f300f9::t_d356963fc17b72 712-714,731-733
+  s_0156e4c6f300f9::t_6442ba890625cc 735-737
+  s_0156e4c6f300f9::t_754fa7752fed44 739-741,799-801
+  s_0156e4c6f300f9::t_0ca1e1a2387c21 837-839,853-855
+  s_0156e4c6f300f9::t_af31ff6ed2a017 869-871,1096-1098
+  s_0156e4c6f300f9::t_27fa8c1e2211d5 1100-1102,1140-1142
+  s_0156e4c6f300f9::t_4a0a213142ddb0 1144-1146,1182-1184
+  s_0156e4c6f300f9::t_e7973862209713 1186-1191
+  s_0156e4c6f300f9::t_19f74c752700ed 1193-1195,1244-1246
+  s_0156e4c6f300f9::t_1a285f87e08290 1248-1250,1282-1284
+  s_0156e4c6f300f9::t_450462aaab3c22 1286-1288
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "ba2c100d7149226750f1ae933aef3e58acbf961f",
+  "prompts": {},
+  "humans": {
+    "h_526ff9ff7f8286": {
+      "author": "unknown <512708478@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_0156e4c6f300f9": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8116cb8bb07753e061a8b4",
+        "model": "glm-5.3"
+      },
+      "human_author": "unknown <512708478@qq.com>",
+      "custom_attributes": {
+        "operation_id": "6a8da1d2043275748dd33c21",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6a8116cb8bb07753e061a8b4",
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "session_id": "6a8116cb8bb07753e061a8b4",
+        "tool_type": "builtin",
+        "source_scene": "agent",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_use_id": "6a8da1d2043275748dd33c21",
+        "dedupe_key": "6a8116cb8bb07753e061a8b4:6a8da1d2043275748dd33c21:afterEdit:93a18a58"
+      }
+    }
+  }
+}
