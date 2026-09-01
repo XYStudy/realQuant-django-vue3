@@ -100,8 +100,21 @@ def _ensure_chat_input_focused(ax, ay):
         logger.info(f"Found send indicator after retry at {indicator_pos}, proceeding to send.")
         return True
 
-    logger.warning("Send indicators still not found after retry; sending may not land in the intended input box.")
-    return False
+    logger.warning("Send indicators still not found after retry; falling back to click below avatar to focus input box.")
+    # 兜底：点击头像下方 350px 处，通常为聊天输入框区域
+    fallback_x = ax
+    fallback_y = ay + 350
+    try:
+        screen_w, screen_h = pyautogui.size()
+        if fallback_y >= screen_h:
+            fallback_y = screen_h - 60
+        logger.info(f"Fallback: clicking ({fallback_x}, {fallback_y}) to focus chat input box...")
+        pyautogui.click(fallback_x, fallback_y)
+        time.sleep(0.8)
+        return True
+    except Exception as e:
+        logger.error(f"Fallback focus click failed: {type(e).__name__}: {e}")
+        return False
 
 def send_wechat_message(content):
     """通过 pyautogui 模拟微信发送消息给多个联系人"""

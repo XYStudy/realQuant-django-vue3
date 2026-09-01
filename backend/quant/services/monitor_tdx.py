@@ -3,11 +3,16 @@ import time
 from datetime import datetime, timedelta
 import pyautogui as pag
 import pandas as pd
+try:
+    import pygetwindow as pgw
+except Exception:
+    pgw = None
 import argparse
 from io import StringIO
 import pyperclip
 import pymysql
 import re
+import json
 try:
     from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
 except ImportError:
@@ -21,6 +26,12 @@ except Exception:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
     from quant.services.auto_analyzer import send_wechat_message
     from quant.services.analyze_new_high import get_today_advice_msg, get_market_advice
+
+# 宏观研判模块（豆包抓取入库后自动调用其 main() 执行分析+打印+入库 macro_daily_signal）
+try:
+    from quant.services import monitor_oil as _macro_oil_mod
+except Exception:
+    _macro_oil_mod = None
 
 IMAGE_DIR = os.path.join(os.path.dirname(__file__), "monitor_images")
 IMG_TDX = os.path.join(IMAGE_DIR, "tdx.png")
@@ -36,6 +47,7 @@ IMG_TAB6 = os.path.join(IMAGE_DIR, "tab6.png")
 IMG_REFRESH_BTN = os.path.join(IMAGE_DIR, "refreshBtn.png")
 IMG_REFRESH_BTN2 = os.path.join(IMAGE_DIR, "refreshBtn2.png")
 IMG_AUTOTIP = os.path.join(IMAGE_DIR, "autoTip.png")
+IMG_IS_DOWNLOAD = os.path.join(IMAGE_DIR, "isDownload.png")
 IMG_EXPORT_BTN = os.path.join(IMAGE_DIR, "exportBtn.png")
 IMG_EXPORT_DO = os.path.join(IMAGE_DIR, "exportDo.png")
 IMG_CANCEL_BTN = os.path.join(IMAGE_DIR, "cancleBtn.png")
@@ -80,6 +92,12 @@ NEW_HIGH_ANALYSIS_WINDOW_MINUTES = 30
 # 统计最近多少个交易日的“实时新高”文件。
 MORNING_NEW_HIGH_ANALYSIS_DAYS = 10
 
+# ===== 早盘宏观流程（紧跟 08:00 新高分析后顺序执行，无需独立时间点） =====
+# 1. 豆包抓取当天宏观市场数据（2Y/10Y/30Y 美债 + Brent/WTI 原油 + LME 铜）→ 入库
+# 2. 调用 monitor_oil.main() 执行宏观流动性研判 → 发送微信报告
+# 总开关：False = 暂时禁用（仍可 --macro-market-data 手动触发）
+ENABLE_MACRO_MARKET_DATA_VIA_DOUBAO = True
+
 # 每天这些整点会尝试发送一次“今日操作建议”。
 ADVICE_HOURS = [10, 11, 13, 14]
 # 整点后的有效触发窗口，超过这个分钟数就不再补发。
@@ -104,12 +122,19 @@ FORCE_SCORING_NOW = False
 
 SCORING_MODE = "new" # "old" ，改为 "new" 仅跑新标准，改为 "serial" 则串行执行
 
+# ================= 7天过滤开关 =================
+# True  : 7天内已评估过的股票跳过，不重新评估（默认，节省调用次数）
+# False : 不过滤，所有股票都重新评估（强制刷新时使用）
+ENABLE_30DAY_FILTER = True
+
 # VMware 共享目录：通达信导出文件和中间结果统一写到这里。
 VMWARE_SHARED_LOG_DIR = r"\\vmware-host\Shared Folders\通达信新高日志"
 
 # 记录上次发送操作建议的时间戳，避免重复发送
 last_advice_sent_time = None
 new_high_analysis_sent_keys = set()
+# 早盘宏观流程去重：f"{日期}_macro"，每天只执行一次（08:00 新高分析后触发）
+macro_market_data_sent_keys = set()
 
 SCORING_STANDARD = """个股评分标准（最终定稿版）
 一、终极判定：满足任一条件直接评为对应分数及评级，杜绝周期陷阱：
@@ -328,11 +353,18 @@ def _locate_center(img_path, confidence=0.85, timeout=3.0, step=0.3, silent=Fals
         print(f"[monitor_tdx] Failed to find {basename} after {timeout}s", flush=True)
     return None
 
+def _clamp_xy(x, y):
+    """将坐标限制在屏幕安全区域内，避开四角 fail-safe 区（pyautogui 在角落会抛异常）。"""
+    try:
+        sw, sh = pag.size()
+        return max(10, min(int(x), sw - 10)), max(10, min(int(y), sh - 10))
+    except Exception:
+        return int(x), int(y)
+
 def _click(img_path, confidence=0.85, timeout=3.0, double=False, move_time=0.5, offset_x=0, offset_y=0, min_confidence=0.55):
     pos = _locate_center(img_path, confidence, timeout, min_confidence=min_confidence)
     if pos:
-        target_x = pos.x + offset_x
-        target_y = pos.y + offset_y
+        target_x, target_y = _clamp_xy(pos.x + offset_x, pos.y + offset_y)
         # 先移动鼠标，带有动画效果
         pag.moveTo(target_x, target_y, duration=move_time)
         if double:
@@ -382,8 +414,9 @@ def _ensure_until_found(target_img, fallback_img, confidence=0.75, step=0.5, mov
         # 1. 尝试查找目标 (缩短超时，静默模式)
         pos = _locate_center(target_img, confidence=confidence, timeout=1.0, silent=True)
         if pos:
-            pag.moveTo(pos.x, pos.y, duration=move_time)
-            pag.click(pos.x, pos.y)
+            sx, sy = _clamp_xy(pos.x, pos.y)
+            pag.moveTo(sx, sy, duration=move_time)
+            pag.click(sx, sy)
             print(f"[monitor_tdx] Successfully found and clicked {target_name} after moving", flush=True)
             return True
         
@@ -412,6 +445,20 @@ def _try_recover_doubao4_5_via_4_6(confidence=0.9, move_time=0.5):
     return _locate_center(IMG_DOUBAO4_5, confidence=confidence, timeout=8.0, silent=True) is not None
 
 def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
+    # 0. 兜底：若豆包/其他窗口遮挡通达信，先用窗口标题激活通达信（不依赖图像识别）
+    if pgw is not None:
+        try:
+            tdx_wins = [w for w in pgw.getAllWindows() if w.title and ("通达信" in w.title or "TDX" in w.title)]
+            if tdx_wins:
+                tdx_win = tdx_wins[0]
+                if tdx_win.isMinimized:
+                    tdx_win.restore()
+                tdx_win.activate()
+                time.sleep(1.0)
+                print(f"[monitor_tdx] TDX window activated via pygetwindow: '{tdx_win.title}'", flush=True)
+        except Exception as e:
+            print(f"[monitor_tdx] Warning: pygetwindow activate failed: {e}", flush=True)
+
     # 1. 如果当前已经在通达信界面（能看到 market.png / market2.png），就不再重复点击 tdx.png
     print("[monitor_tdx] --- Step 1: Ensure TDX is active ---", flush=True)
     pos_market = _locate_center(IMG_MARKET, confidence=0.7, timeout=0.5, silent=True)
@@ -449,7 +496,8 @@ def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
             
             if pos_bk:
                 print(f"[monitor_tdx] Found bankuai, clicking it to reveal {target_tab_name}...", flush=True)
-                pag.click(pos_bk.x, pos_bk.y)
+                bx, by = _clamp_xy(pos_bk.x, pos_bk.y)
+                pag.click(bx, by)
                 time.sleep(1.0)
                 continue # 继续循环找 target_tab
             else:
@@ -457,7 +505,8 @@ def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
                 pos_left = _locate_center(IMG_LEFT_TAB, confidence=0.7, timeout=0.5, silent=True)
                 if pos_left:
                     print("[monitor_tdx] Found leftTab, clicking it to switch view...", flush=True)
-                    pag.click(pos_left.x, pos_left.y)
+                    lx, ly = _clamp_xy(pos_left.x, pos_left.y)
+                    pag.click(lx, ly)
                     time.sleep(0.5)
                     continue # 重新循环找 bankuai / target_tab
                 else:
@@ -471,12 +520,14 @@ def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
 
                     if pos_market:
                         print(f"[monitor_tdx] Found {market_name}, clicking it to reveal leftTab...", flush=True)
-                        pag.click(pos_market.x, pos_market.y)
+                        mx, my = _clamp_xy(pos_market.x, pos_market.y)
+                        pag.click(mx, my)
                         print("[monitor_tdx] Waiting for leftTab.png to appear (up to 60s)...", flush=True)
                         pos_left_wait = _locate_center(IMG_LEFT_TAB, confidence=0.7, timeout=60.0)
                         if pos_left_wait:
                             print("[monitor_tdx] Found leftTab.png after clicking market area, clicking it...", flush=True)
-                            pag.click(pos_left_wait.x, pos_left_wait.y)
+                            lwx, lwy = _clamp_xy(pos_left_wait.x, pos_left_wait.y)
+                            pag.click(lwx, lwy)
                             time.sleep(0.5)
                             continue
                     else:
@@ -484,7 +535,8 @@ def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
         else:
             # 找到了 target_tab，先点击一下，再找刷新按钮
             print(f"[monitor_tdx] Found {target_tab_name}, clicking it to reveal refresh button...", flush=True)
-            pag.click(pos_tab.x, pos_tab.y)
+            tx, ty = _clamp_xy(pos_tab.x, pos_tab.y)
+            pag.click(tx, ty)
             time.sleep(0.5) # 给刷新按钮显示一点时间
 
             # 查找并点击刷新按钮
@@ -494,7 +546,8 @@ def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
 
             if pos_refresh_btn:
                 print("[monitor_tdx] Found refresh button, clicking it...", flush=True)
-                pag.click(pos_refresh_btn.x, pos_refresh_btn.y)
+                rx, ry = _clamp_xy(pos_refresh_btn.x, pos_refresh_btn.y)
+                pag.click(rx, ry)
                 refresh_clicked = True
                 break
             else:
@@ -510,11 +563,24 @@ def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
         print("[monitor_tdx] Error: Failed to find/click refresh button after 60s", flush=True)
         return None
 
+    # 2.5 检查是否有 isDownload.png 弹窗，存在则点击它再继续
+    if os.path.exists(IMG_IS_DOWNLOAD):
+        is_dl_pos = _locate_center(IMG_IS_DOWNLOAD, confidence=0.8, timeout=2.0, silent=True)
+        if is_dl_pos:
+            print(f"[monitor_tdx] Found isDownload.png, clicking it before continuing...", flush=True)
+            idx, idy = _clamp_xy(is_dl_pos.x, is_dl_pos.y)
+            pag.click(idx, idy)
+            time.sleep(1.0)
+        else:
+            print("[monitor_tdx] isDownload.png not found on screen, skipping.", flush=True)
+    else:
+        print("[monitor_tdx] isDownload.png not configured (file missing), skipping check.", flush=True)
+
     # 3. 等待 autoTip.png 出现并消失 (自动选股过程)
     print("[monitor_tdx] --- Step 3: Waiting for auto-selection (autoTip) ---", flush=True)
     start_wait = time.time()
     # 整个 Step 3 的最大允许时间为 10 分钟 (600秒)
-    MAX_STEP3_TIME = 600
+    MAX_STEP3_TIME = 200
     tip_appeared = False
     
     while True:
@@ -560,8 +626,7 @@ def _export_file(target_tab=IMG_TAB3, export_file_prefix="实时新高"):
     print("[monitor_tdx] --- Step 3.5: Click below code.png ---", flush=True)
     pos_code = _locate_center(IMG_CODE, confidence=0.7, timeout=3.0)
     if pos_code:
-        target_x = pos_code.x
-        target_y = pos_code.y + 50
+        target_x, target_y = _clamp_xy(pos_code.x, pos_code.y + 20)
         print(f"[monitor_tdx] Found code.png at {pos_code}, clicking below it at ({target_x}, {target_y})...", flush=True)
         pag.moveTo(target_x, target_y, duration=0.5)
         pag.click(target_x, target_y)
@@ -689,7 +754,7 @@ def _read_records(file_path):
                 # 如果没找到表头，假设从第 1 行开始就是数据
                 print("[monitor_tdx] Header not found, assuming data starts from line 1", flush=True)
                 data_lines = lines
-                code_idx, name_idx, ind_idx, zdf_idx = 0, 1, 2, -1
+                code_idx, name_idx, ind_idx, zdf_idx, hs_idx = 0, 1, 2, -1, -1
             else:
                 header = lines[header_idx].split('\t')
                 print(f"[monitor_tdx] Header found at line {header_idx+1}: {header}", flush=True)
@@ -698,6 +763,7 @@ def _read_records(file_path):
                 name_idx = next((i for i, h in enumerate(header) if any(k in h for k in ["名称", "证券名称", "Name"])), 1)
                 ind_idx = next((i for i, h in enumerate(header) if any(k in h for k in ["细分行业", "行业", "Industry"])), 2)
                 zdf_idx = next((i for i, h in enumerate(header) if "涨幅" in h or "涨跌幅" in h), -1)
+                hs_idx = next((i for i, h in enumerate(header) if "换手" in h), -1)
                 data_lines = lines[header_idx+1:]
 
             for line in data_lines:
@@ -707,7 +773,8 @@ def _read_records(file_path):
                     name = parts[name_idx].strip()
                     industry = parts[ind_idx].strip() if ind_idx < len(parts) else ""
                     zdf = parts[zdf_idx].strip() if zdf_idx != -1 and zdf_idx < len(parts) else ""
-                    
+                    turnover = parts[hs_idx].strip() if hs_idx != -1 and hs_idx < len(parts) else ""
+
                     # 补齐 6 位代码
                     if code.isdigit() and len(code) < 6:
                         code = code.zfill(6)
@@ -717,14 +784,14 @@ def _read_records(file_path):
                         if code.startswith('9'):
                             print(f"[monitor_tdx] Filtering out code starting with 9: {code} | {name}", flush=True)
                             continue
-                        recs.append((code, name, industry, zdf)) 
-            
+                        recs.append((code, name, industry, zdf, turnover))
+
             if recs:
                 print(f"[monitor_tdx] Successfully parsed via manual TXT parsing, records={len(recs)}", flush=True)
                 # 打印所有数据进行核对
                 print("[monitor_tdx] --- Detailed Records Start ---", flush=True)
-                for i, (c, n, ind, zdf) in enumerate(recs):
-                    print(f"[monitor_tdx] Row {i+1}: {c} | {n} | {ind} | {zdf}", flush=True)
+                for i, (c, n, ind, zdf, hs) in enumerate(recs):
+                    print(f"[monitor_tdx] Row {i+1}: {c} | {n} | {ind} | {zdf} | 换手:{hs}", flush=True)
                 print(f"[monitor_tdx] --- Total Extracted: {len(recs)} records ---", flush=True)
                 return recs
         except Exception as e:
@@ -763,7 +830,7 @@ def _query_stock_scores(codes):
 
         # 1) 先查 v2 表
         try:
-            cursor.execute(f"SELECT code, name, score_part1, score_part2, score_part3, part4_category, score_part5 FROM stock_deep_analysis_v2 WHERE code IN ({format_strings})", tuple(codes))
+            cursor.execute(f"SELECT code, name, score_part1, score_part2, score_part3, part4_category, score_part5, total_score FROM stock_deep_analysis_v2 WHERE code IN ({format_strings})", tuple(codes))
             for row in cursor.fetchall():
                 if row['score_part1'] or row['score_part2'] or row['score_part3'] or row['score_part5']:
                     info_map[row['code']] = {
@@ -773,6 +840,7 @@ def _query_stock_scores(codes):
                         'p3': row['score_part3'] or 0,
                         'part4': (row['part4_category'] or '').strip(),
                         'p5': row['score_part5'] or 0,
+                        'total_score': row['total_score'] if row['total_score'] is not None else 0,
                     }
         except Exception as e:
             print(f"[monitor_tdx] v2 query error (table may not exist): {e}", flush=True)
@@ -795,66 +863,67 @@ def _query_stock_scores(codes):
     return info_map
 
 
-def _build_score_suffix(info):
-    """根据 info 组装评分后缀文本和排序分。"""
+def _build_score_suffix(info, turnover=""):
+    """根据 info 组装评分后缀文本和排序分。turnover 为换手率文本，来自导出的 txt 文件。"""
+    hs_str = f" 换手:{turnover}" if turnover else ""
     if info['source'] == 'v2':
-        # 格式: 第四类 龙头89 泡沫61 基本面115 翻倍50
-        suffix = f" {info['part4']} 龙头{info['p1']} 泡沫{info['p2']} 基本面{info['p3']} 翻倍{info['p5']}"
+        # 格式: 第四类 龙头89 泡沫61 基本面115 翻倍50 总分150 换手:3.21%
+        suffix = f" {info['part4']} 龙头{info['p1']} 泡沫{info['p2']} 基本面{info['p3']} 翻倍{info['p5']} 总分{info['total_score']}{hs_str}"
         sort_score = info['p1'] + info['p3'] + info['p5']
     else:
-        suffix = f" [{info['result_type']}] {info['score']}分"
+        suffix = f" [{info['result_type']}] {info['score']}分{hs_str}"
         sort_score = info['score']
     return suffix, sort_score
 
 
 def _compose_all_msg(recs):
     # 查询数据库获取个股评价（优先 v2，回退老表）
-    codes = [c for c, _, _, _ in recs]
+    codes = [c for c, *_ in recs]
     db_info = _query_stock_scores(codes)
 
     # 给 recs 附加排序分
     recs_with_score = []
-    for c, n, i, zdf in recs:
+    for c, n, i, zdf, hs in recs:
         sort_score = -1
         if c in db_info:
-            _, sort_score = _build_score_suffix(db_info[c])
-        recs_with_score.append((c, n, i, zdf, sort_score))
+            _, sort_score = _build_score_suffix(db_info[c], hs)
+        recs_with_score.append((c, n, i, zdf, hs, sort_score))
 
     # 根据分数降序排序
-    recs_with_score.sort(key=lambda x: x[4], reverse=True)
+    recs_with_score.sort(key=lambda x: x[5], reverse=True)
 
     # 每行: 股票代码 股票名称 细分行业 + 评分后缀
     lines = []
-    for c, n, i, zdf, score in recs_with_score:
+    for c, n, i, zdf, hs, score in recs_with_score:
         base_line = f"{c} {n} {i}"
         if c in db_info:
-            suffix, _ = _build_score_suffix(db_info[c])
+            suffix, _ = _build_score_suffix(db_info[c], hs)
             base_line += suffix
         lines.append(base_line)
     return "\n".join(lines)
 
 def _compose_incremental_msg(new_recs):
     # 查询数据库获取个股评价（优先 v2，回退老表）
-    codes = [c for c, _, _, _ in new_recs]
+    codes = [c for c, *_ in new_recs]
     db_info = _query_stock_scores(codes)
 
     # 给 new_recs 附加排序分
     recs_with_score = []
-    for c, n, i, zdf in new_recs:
+    for c, n, i, zdf, hs in new_recs:
         sort_score = -1
         if c in db_info:
-            _, sort_score = _build_score_suffix(db_info[c])
-        recs_with_score.append((c, n, i, zdf, sort_score))
+            _, sort_score = _build_score_suffix(db_info[c], hs)
+        recs_with_score.append((c, n, i, zdf, hs, sort_score))
 
     # 根据分数降序排序
-    recs_with_score.sort(key=lambda x: x[4], reverse=True)
+    recs_with_score.sort(key=lambda x: x[5], reverse=True)
 
     # 仅针对新增股票的提醒格式: 代码 名称 细分行业 + 评分后缀
     lines = []
-    for c, n, i, zdf, score in recs_with_score:
+    for c, n, i, zdf, hs, score in recs_with_score:
         base_line = f"{c} {n} {i}"
         if c in db_info:
-            suffix, _ = _build_score_suffix(db_info[c])
+            suffix, _ = _build_score_suffix(db_info[c], hs)
             base_line += suffix
         lines.append(base_line)
 
@@ -871,7 +940,7 @@ def _compose_industry_cluster_msg(recs):
     from collections import Counter
     # 提取所有行业（过滤掉排除名单和空值）
     exclude_list = ["其他通用设备", "其他专用设备", ""]
-    industries = [i for _, _, i, _ in recs if i not in exclude_list]
+    industries = [i for _, _, i, *_ in recs if i not in exclude_list]
     
     counts = Counter(industries)
     cluster_msgs = []
@@ -893,9 +962,8 @@ def _handle_stuck_screens():
             
             if pos:
                 print(f"[monitor_tdx] Stuck screen detected via {os.path.basename(img)} at {pos}, clicking to clear...", flush=True)
-                # 移动到该位置右侧 15 像素（确保在“取消”按钮内部靠右）
-                target_x = pos.x + 15
-                target_y = pos.y
+                # 移动到该位置右侧 15 像素（确保在"取消"按钮内部靠右）
+                target_x, target_y = _clamp_xy(pos.x + 15, pos.y)
                 pag.moveTo(target_x, target_y, duration=0.5)
                 pag.click(target_x, target_y)
                 # 成功处理一个就返回
@@ -1085,11 +1153,11 @@ def _check_and_send_new_high_analysis():
         stats = _get_recent_new_high_file_stats(MORNING_NEW_HIGH_ANALYSIS_DAYS)
         if not stats:
             print(f"[monitor_tdx] New high analysis skipped at {analysis_time}: no recent realtime-new-high files found.", flush=True)
-            return False
+            continue
 
         msg = _build_new_high_trend_summary(stats, analysis_time)
         if not msg:
-            return False
+            continue
 
         print(f"[monitor_tdx] Sending realtime-new-high trend analysis for {analysis_time} at {now.strftime('%H:%M:%S')}...", flush=True)
         send_wechat_message(msg)
@@ -1097,6 +1165,538 @@ def _check_and_send_new_high_analysis():
         return True
 
     return False
+
+def _init_macro_market_data_table():
+    """初始化 macro_market_daily_data 表（如不存在）。"""
+    try:
+        try:
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS macro_market_daily_data (
+                trade_date DATE PRIMARY KEY COMMENT '北京时间交易日',
+                y2 DECIMAL(6,3) COMMENT '2Y美债收益率(%)',
+                y10 DECIMAL(6,3) COMMENT '10Y美债收益率(%)',
+                y30 DECIMAL(6,3) COMMENT '30Y美债收益率(%)',
+                brent DECIMAL(10,3) COMMENT '布伦特原油(美元/桶)',
+                wti DECIMAL(10,3) COMMENT 'WTI原油(美元/桶)',
+                copper DECIMAL(10,3) COMMENT 'LME铜(美元/公吨)',
+                update_time DATETIME COMMENT '入库时间',
+                raw_json TEXT COMMENT '豆包原始返回文本'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[monitor_tdx] [macro_market_data] init table failed: {e}", flush=True)
+        return False
+
+def _send_msg_to_doubao_and_get_response(msg, max_wait_seconds=180):
+    """
+    向豆包发送一条消息并获取回复文本（复用现有 GUI 元素定位流程）。
+    返回 (result_text, err_msg)；成功时 err_msg=None。
+    """
+    if not _ensure_click(IMG_DOUBAO1, retries=3, confidence=0.8, move_time=0.5):
+        return None, "Failed to click doubao1.png"
+    time.sleep(1.0)
+    if not _ensure_click(IMG_DOUBAO2_1, retries=3, confidence=0.8, move_time=0.5, offset_y=-30):
+        return None, "Failed to click doubao2.1.png offset"
+    time.sleep(1.0)
+
+    clicked_input = _ensure_click(IMG_DOUBAO3_5, retries=2, confidence=0.8, move_time=0.5)
+    if not clicked_input:
+        clicked_input = _ensure_click(IMG_DOUBAO3_6, retries=2, confidence=0.8, move_time=0.5)
+    if not clicked_input:
+        clicked_input = _ensure_click(IMG_DOUBAO3_7, retries=2, confidence=0.8, move_time=0.5)
+    if not clicked_input:
+        return None, "Failed to focus input box"
+    time.sleep(0.5)
+
+    pyperclip.copy(msg)
+    time.sleep(0.5)
+    pag.hotkey('ctrl', 'v')
+    time.sleep(1.0)
+    pag.press('enter')
+    print("[monitor_tdx] [macro_market_data] Message sent to Doubao, waiting for response...", flush=True)
+
+    # 等待结果就绪（doubao4.5.png）
+    result_ready = False
+    recover_clicked = False
+    start = time.time()
+    while time.time() - start < max_wait_seconds:
+        if _locate_center(IMG_DOUBAO4_5, confidence=0.8, timeout=1.0, silent=True):
+            result_ready = True
+            break
+        if not recover_clicked and _locate_center(IMG_DOUBAO4_6, confidence=0.9, timeout=0.5, silent=True, min_confidence=0.85):
+            print("[monitor_tdx] [macro_market_data] doubao4.5.png not found, clicking doubao4.6.png then retry...", flush=True)
+            if _ensure_click(IMG_DOUBAO4_6, retries=2, confidence=0.9, move_time=0.5, min_confidence=0.85):
+                recover_clicked = True
+                time.sleep(1.0)
+                continue
+        time.sleep(1.0)
+
+    if not result_ready and not recover_clicked and _try_recover_doubao4_5_via_4_6():
+        result_ready = _locate_center(IMG_DOUBAO4_5, confidence=0.8, timeout=2.0, silent=True) is not None
+
+    if not result_ready:
+        return None, f"doubao4.5.png not found within {max_wait_seconds}s"
+
+    time.sleep(5.0)
+
+    # 找复制按钮（doubao5.png / doubao5.5.png），取最底部的
+    all_pos5 = []
+    copy_wait = 60
+    while copy_wait > 0:
+        all_pos5 = list(pag.locateAllOnScreen(IMG_DOUBAO5, confidence=0.8, grayscale=True))
+        if not all_pos5:
+            all_pos5 = list(pag.locateAllOnScreen(IMG_DOUBAO5_5, confidence=0.8, grayscale=True))
+        if all_pos5:
+            break
+        time.sleep(1.0)
+        copy_wait -= 1
+
+    if not all_pos5:
+        return None, "doubao5.png copy button not found"
+
+    bottom = sorted(all_pos5, key=lambda p: p.top, reverse=True)[0]
+    center_x = bottom.left + bottom.width / 2
+    center_y = bottom.top + bottom.height / 2
+    pag.moveTo(center_x, center_y, 0.5)
+    pag.click()
+    time.sleep(1.0)
+    return pyperclip.paste(), None
+
+def _fetch_macro_market_data_via_doubao(d):
+    """
+    通过豆包抓取当天宏观市场数据（2Y/10Y/30Y 美债 + Brent/WTI 原油 + LME 铜）。
+    流程：发送提示词 → 解析 JSON → 落文件到 VMWARE_SHARED_LOG_DIR → 入库 macro_market_daily_data。
+    参数 d: 日期字符串 YYYYMMDD
+    返回 True/False
+    """
+    date_cn = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    prompt = (
+        f"【任务说明】\n"
+        f"获取北京时间 {date_cn} 最新市场数据：2Y 美债收益率、10Y 美债收益率、30Y 美债收益率；"
+        f"原油采用 DCOILBRENTEU 布伦特原油、DCOILWTICO WTI 原油；铜采用 PCOPPUSDM LME 铜。\n"
+        f"数据要求：y2/y10/y30 单位为百分比，仅填数值；brent/wti 单位美元/桶；copper 单位美元/公吨。"
+        f"必须使用真实可核验最新行情数值，禁止编造模拟数据。\n"
+        f"【输出强制约束】\n"
+        f"仅输出可被 JSON.parse 直接解析的标准 JSON 对象，禁止 // 注释、禁止 markdown 代码块标记、"
+        f"禁止任何前置后置文字、解释、备注、说明；\n"
+        f"严格固定字段名：y2、y10、y30、brent、wti、copper；\n"
+        f"全部 value 为数字类型，不要字符串包裹；不允许多余字段；\n"
+        f"JSON 语法严格合规，无尾随逗号。\n"
+        f"【输出 Schema 模板，严格复用该字段结构】\n"
+        f"{{\n"
+        f'  "y2": number,\n'
+        f'  "y10": number,\n'
+        f'  "y30": number,\n'
+        f'  "brent": number,\n'
+        f'  "wti": number,\n'
+        f'  "copper": number\n'
+        f"}}"
+    )
+
+    print(f"[monitor_tdx] [macro_market_data] Sending prompt to Doubao for {date_cn}...", flush=True)
+    raw_text, err = _send_msg_to_doubao_and_get_response(prompt, max_wait_seconds=180)
+    if not raw_text:
+        print(f"[monitor_tdx] [macro_market_data] Failed: {err}", flush=True)
+        return False
+
+    print(f"[monitor_tdx] [macro_market_data] Got response (len={len(raw_text)}), parsing JSON...", flush=True)
+
+    # 优先整体解析；失败则尝试从 markdown 代码块、再退化到第一个 { 到最后一个 } 的贪婪匹配
+    json_obj = None
+    try:
+        json_obj = json.loads(raw_text)
+    except Exception:
+        pass
+    if not json_obj:
+        m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_text, re.DOTALL)
+        if m:
+            try:
+                json_obj = json.loads(m.group(1))
+            except Exception:
+                pass
+    if not json_obj:
+        m = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if m:
+            try:
+                json_obj = json.loads(m.group(0))
+            except Exception:
+                pass
+
+    if not json_obj:
+        print(f"[monitor_tdx] [macro_market_data] JSON parse failed, raw head: {raw_text[:500]}", flush=True)
+        return False
+
+    required = ["y2", "y10", "y30", "brent", "wti", "copper"]
+    for k in required:
+        if k not in json_obj:
+            print(f"[monitor_tdx] [macro_market_data] Missing field: {k}", flush=True)
+            return False
+
+    # 1. 落文件到 VMWARE_SHARED_LOG_DIR/美债石油铜YYYYMMDD.json
+    try:
+        if not os.path.exists(VMWARE_SHARED_LOG_DIR):
+            os.makedirs(VMWARE_SHARED_LOG_DIR, exist_ok=True)
+        file_path = os.path.join(VMWARE_SHARED_LOG_DIR, f"美债石油铜{d}.json")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(json_obj, f, ensure_ascii=False, indent=2)
+        print(f"[monitor_tdx] [macro_market_data] Saved to {file_path}", flush=True)
+    except Exception as e:
+        print(f"[monitor_tdx] [macro_market_data] Warning: failed to save file: {e}", flush=True)
+
+    # 2. 入库
+    try:
+        try:
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        _init_macro_market_data_table()
+        conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+        cur = conn.cursor()
+        sql = """
+            INSERT INTO macro_market_daily_data
+                (trade_date, y2, y10, y30, brent, wti, copper, update_time, raw_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+            ON DUPLICATE KEY UPDATE
+                y2=VALUES(y2), y10=VALUES(y10), y30=VALUES(y30),
+                brent=VALUES(brent), wti=VALUES(wti), copper=VALUES(copper),
+                update_time=NOW(), raw_json=VALUES(raw_json)
+        """
+        cur.execute(sql, (
+            date_cn,
+            float(json_obj["y2"]), float(json_obj["y10"]), float(json_obj["y30"]),
+            float(json_obj["brent"]), float(json_obj["wti"]), float(json_obj["copper"]),
+            raw_text,
+        ))
+        conn.commit()
+        conn.close()
+        print(f"[monitor_tdx] [macro_market_data] DB upserted for {date_cn}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[monitor_tdx] [macro_market_data] DB error: {e}", flush=True)
+        return False
+
+FRED_API_KEY = "ebc963c614660448cfac325dccc63055"
+# FRED series ID → 内部字段名映射
+_FRED_SERIES = {
+    "DGS2":           "y2",
+    "DGS10":          "y10",
+    "DGS30":          "y30",
+    "DCOILBRENTEU":   "brent",
+    "DCOILWTICO":     "wti",
+    "PCOPPUSDM":      "copper",
+}
+# 官方数据校准回看窗口（天）：覆盖最近 N 天的数据库记录
+REFINE_LOOKBACK_DAYS = 60
+
+def _fetch_fred_history(series_id, days=REFINE_LOOKBACK_DAYS):
+    """从 FRED 获取 series 最近 N 天的观测值（按日期升序）。
+    返回 [(date_str, value), ...]，date_str 格式 'YYYY-MM-DD'
+    """
+    import urllib.request
+    import urllib.parse
+    try:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        url = (f"https://api.stlouisfed.org/fred/series/observations"
+               f"?series_id={urllib.parse.quote(series_id)}"
+               f"&api_key={FRED_API_KEY}"
+               f"&file_type=json"
+               f"&observation_start={start_date}"
+               f"&observation_end={end_date}"
+               f"&limit=1000"
+               f"&sort_order=asc")
+        req = urllib.request.Request(url, headers={"User-Agent": "monitor_tdx/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        obs_list = data.get("observations") or []
+        result = []
+        for ob in obs_list:
+            v = ob.get("value")
+            if v is None or v == "." or v == "":
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            result.append((ob.get("date"), fv))
+        return result
+    except Exception as e:
+        print(f"[monitor_tdx] [fred] {series_id} history fetch error: {e}", flush=True)
+        return []
+
+def _fetch_akshare_us_treasury_history(days=REFINE_LOOKBACK_DAYS):
+    """从 akshare 获取美债收益率历史。
+    返回 {date_str: {"y2": v, "y10": v, "y30": v}}，date_str 格式 'YYYY-MM-DD'
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        print("[monitor_tdx] [akshare] akshare not installed", flush=True)
+        return {}
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    result = {}
+    try:
+        df = ak.bond_zh_us_rate(start_date=start_date)
+        if df is None or len(df) == 0:
+            return {}
+        col_map = {"y2": "2年期收益率", "y10": "10年期收益率", "y30": "30年期收益率"}
+        for _, row in df.iterrows():
+            # akshare 日期列可能是 "日期" 或 index
+            d_val = row.get("日期") if hasattr(row, "get") else None
+            if d_val is None:
+                continue
+            try:
+                d_str = str(d_val)[:10]
+            except Exception:
+                continue
+            entry = {}
+            for k, col in col_map.items():
+                if col in df.columns:
+                    v = row[col]
+                    if v is not None and str(v).strip() != "":
+                        try:
+                            entry[k] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+            if entry:
+                result[d_str] = entry
+    except Exception as e:
+        print(f"[monitor_tdx] [akshare] us_treasury history fetch error: {e}", flush=True)
+    return result
+
+def _fetch_akshare_commodity_history(field, days=REFINE_LOOKBACK_DAYS):
+    """从 akshare 获取大宗商品历史收盘价。
+    field: 'brent' / 'wti' / 'copper'
+    返回 {date_str: value}，date_str 格式 'YYYY-MM-DD'
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        return {}
+    symbol_map = {"brent": "B", "wti": "CL", "copper": "HG"}
+    symbol = symbol_map.get(field)
+    if not symbol:
+        return {}
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    end_date = datetime.now().strftime("%Y%m%d")
+    result = {}
+    try:
+        df = ak.futures_foreign_hist(symbol=symbol, start_date=start_date, end_date=end_date)
+        if df is None or len(df) == 0:
+            return {}
+        for _, row in df.iterrows():
+            d_val = row.get("日期") if hasattr(row, "get") else None
+            if d_val is None:
+                continue
+            try:
+                d_str = str(d_val)[:10]
+            except Exception:
+                continue
+            for col in ["收盘", "Close", "close"]:
+                if col in df.columns:
+                    v = row[col]
+                    if v is not None and str(v).strip() != "":
+                        try:
+                            result[d_str] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+                        break
+    except Exception as e:
+        print(f"[monitor_tdx] [akshare] {field}({symbol}) history fetch error: {e}", flush=True)
+    return result
+
+def _refine_macro_market_data_from_official_sources(d):
+    """豆包抓取入库后，用 FRED + akshare 官方数据校准 macro_market_daily_data 表。
+    规则：
+      - 拉取 FRED + akshare 最近 REFINE_LOOKBACK_DAYS 天的历史观测
+      - 按观测日期聚合：{date1: {y2: v, y10: v, ...}, date2: {...}}
+      - 仅 UPDATE 数据库中已存在的日期行（不主动 INSERT 新日期）
+      - FRED 优先，akshare 仅补 FRED 缺失的字段
+      - 每个字段只覆盖非空值，空/None 保留原值
+    d: YYYYMMDD 字符串（仅用于日志标识）
+    """
+    date_cn = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    print(f"[monitor_tdx] [refine] Fetching official history from FRED + akshare (lookback={REFINE_LOOKBACK_DAYS}d)...", flush=True)
+
+    # date_str → {field: value}
+    merged_by_date = {}
+
+    # 1. FRED 历史
+    for sid, field in _FRED_SERIES.items():
+        hist = _fetch_fred_history(sid)
+        print(f"[monitor_tdx] [fred] {sid}({field}): {len(hist)} observations", flush=True)
+        for obs_date, v in hist:
+            if not obs_date:
+                continue
+            merged_by_date.setdefault(obs_date, {})[field] = v
+
+    # 2. akshare 历史（补 FRED 缺失的字段）
+    ak_bond_hist = _fetch_akshare_us_treasury_history()
+    print(f"[monitor_tdx] [akshare] us_treasury: {len(ak_bond_hist)} days", flush=True)
+    for d_str, fields in ak_bond_hist.items():
+        for k in ("y2", "y10", "y30"):
+            if k in fields:
+                merged_by_date.setdefault(d_str, {}).setdefault(k, fields[k])
+
+    for field in ("brent", "wti", "copper"):
+        ak_hist = _fetch_akshare_commodity_history(field)
+        print(f"[monitor_tdx] [akshare] {field}: {len(ak_hist)} days", flush=True)
+        for d_str, v in ak_hist.items():
+            merged_by_date.setdefault(d_str, {}).setdefault(field, v)
+
+    if not merged_by_date:
+        print(f"[monitor_tdx] [refine] No official history fetched, keep doubao values.", flush=True)
+        return False
+
+    # 3. 批量 UPDATE 数据库（仅对已存在的日期行）
+    try:
+        try:
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+        cur = conn.cursor()
+
+        total_updated = 0
+        fields_touched = set()
+        for d_str, fields in sorted(merged_by_date.items()):
+            set_clauses = []
+            params = []
+            for field in ("y2", "y10", "y30", "brent", "wti", "copper"):
+                if field in fields:
+                    set_clauses.append(f"{field}=%s")
+                    params.append(float(fields[field]))
+                    fields_touched.add(field)
+            if not set_clauses:
+                continue
+            set_clauses.append("update_time=NOW()")
+            params.append(d_str)
+            sql = f"UPDATE macro_market_daily_data SET {', '.join(set_clauses)} WHERE trade_date=%s"
+            try:
+                cur.execute(sql, params)
+                if cur.rowcount > 0:
+                    total_updated += cur.rowcount
+            except Exception as ex:
+                print(f"[monitor_tdx] [refine] UPDATE {d_str} error: {ex}", flush=True)
+        conn.commit()
+        conn.close()
+        print(f"[monitor_tdx] [refine] DB calibrated: {total_updated} rows updated, fields={sorted(fields_touched)}", flush=True)
+        return total_updated > 0
+    except Exception as e:
+        print(f"[monitor_tdx] [refine] DB update error: {e}", flush=True)
+        return False
+
+def _has_macro_market_data_in_db(d):
+    """查询 macro_market_daily_data 表是否已有当天数据。
+    d: YYYYMMDD 字符串
+    返回: True=已存在, False=不存在或查询失败
+    """
+    try:
+        try:
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+        date_cn = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+        conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME, connect_timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM macro_market_daily_data WHERE trade_date=%s LIMIT 1", (date_cn,))
+        row = cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        print(f"[monitor_tdx] [macro_market_data] DB check failed: {e}", flush=True)
+        return False
+
+def _run_morning_macro_flow(d):
+    """
+    早盘宏观流程（08:00 新高分析后顺序调用）：
+    1. 豆包抓取当天宏观市场数据 → 入库
+    2. 调用 monitor_oil.main() 执行宏观流动性研判 → 发送微信报告
+    去重：
+      - 优先查数据库 macro_market_daily_data 是否已有当天数据，有则跳过
+      - 内存 set 作为二级去重，防止同一次运行内重复进入
+    """
+    if not ENABLE_MACRO_MARKET_DATA_VIA_DOUBAO:
+        return False
+    key = f"{d}_macro"
+    if key in macro_market_data_sent_keys:
+        return False
+
+    # 优先查库：今天已有数据则不再执行（程序重启后也能正确跳过）
+    if _has_macro_market_data_in_db(d):
+        print(f"[monitor_tdx] [macro_market_data] DB already has data for {d}, skip morning macro flow.", flush=True)
+        macro_market_data_sent_keys.add(key)
+        return False
+
+    macro_market_data_sent_keys.add(key)  # 提前去重，防止主循环重复进入
+
+    now = datetime.now()
+    print(f"[monitor_tdx] ===== 早盘宏观流程开始 @ {now.strftime('%H:%M:%S')} =====", flush=True)
+    print(f"[monitor_tdx] [1/2] 豆包抓取宏观市场数据...", flush=True)
+    ok = _fetch_macro_market_data_via_doubao(d)
+    print(f"[monitor_tdx] [macro_market_data] done, ok={ok}", flush=True)
+
+    # 1.5 用 FRED + akshare 官方数据覆盖豆包采集值（仅覆盖非空字段）
+    # 豆包抓取可能不准，这一步保证关键利率/大宗商品至少是官方真实数据（有延迟但准确）
+    # 即使豆包抓取失败，只要数据库里有当天记录（ON DUPLICATE KEY 场景外），也尝试用官方数据补全
+    try:
+        _refine_macro_market_data_from_official_sources(d)
+    except Exception as e:
+        print(f"[monitor_tdx] [refine] error (non-fatal): {e}", flush=True)
+
+    print(f"[monitor_tdx] [2/2] 调用 monitor_oil 执行宏观流动性研判...", flush=True)
+    _run_macro_oil_analysis_and_print()
+    print(f"[monitor_tdx] ===== 早盘宏观流程结束 @ {datetime.now().strftime('%H:%M:%S')} =====", flush=True)
+    return True
+
+def _run_macro_oil_analysis_and_print():
+    """豆包抓取入库后，调用 monitor_oil.main() 执行宏观研判：读取 macro_market_daily_data →
+    计算 V3 组合信号/打分 → 入库 macro_daily_signal → 打印报告 → 发送微信。
+    - 抓取失败或模块未加载时跳过
+    - 分析异常不阻断主流程（仅打印错误）
+    """
+    if _macro_oil_mod is None:
+        print("[monitor_tdx] monitor_oil 模块未加载，跳过宏观研判", flush=True)
+        return
+    print("\n[monitor_tdx] ===== 调用 monitor_oil 执行宏观研判 =====", flush=True)
+    try:
+        summary_text = _macro_oil_mod.main()
+        # 将研判报告发送到微信（与 08:20 子进程流程保持一致的标题前缀）
+        if summary_text:
+            header = "【宏观研判报告】"
+            final_msg = f"{header}\n\n{summary_text}"
+            try:
+                send_wechat_message(final_msg)
+                print(f"[monitor_tdx] 宏观研判报告已发送至微信 @ {datetime.now().strftime('%H:%M:%S')}", flush=True)
+            except Exception as we:
+                print(f"[monitor_tdx] 微信发送失败: {we}", flush=True)
+        else:
+            print("[monitor_tdx] monitor_oil 未返回报告文本，跳过微信发送", flush=True)
+    except Exception as e:
+        import traceback
+        print(f"[monitor_tdx] monitor_oil 分析异常: {e}", flush=True)
+        traceback.print_exc()
+        # 异常也通知微信，便于人工介入
+        try:
+            send_wechat_message(f"【宏观流动性研判】\n⚠️ monitor_oil 分析异常：{e}")
+        except Exception:
+            pass
 
 def _check_and_send_advice():
     """
@@ -1186,7 +1786,9 @@ def _check_and_run_special_tasks(d, current_time_str):
                 if recs_5:
                     msg_5 = _compose_all_msg(recs_5)
                     final_msg_5 = f"【起爆点 {t}】\n{msg_5}"
+                    print(f"[monitor_tdx] QBD tab5: composed msg len={len(final_msg_5)}, records={len(recs_5)}, sending...", flush=True)
                     send_wechat_message(final_msg_5)
+                    print(f"[monitor_tdx] QBD tab5: send_wechat_message returned for {t}", flush=True)
                 else:
                     print(f"[monitor_tdx] No records found for tab5 at {t}.", flush=True)
                 special_tasks_done.add(qbd_key)
@@ -1200,7 +1802,7 @@ def _check_and_run_special_tasks(d, current_time_str):
                 if recs_6:
                     # 提取涨幅并附加到记录中用于排序
                     recs_with_zdf = []
-                    for c, n, i, zdf in recs_6:
+                    for c, n, i, zdf, *_ in recs_6:
                         zdf_val = 0.0
                         if zdf:
                             try:
@@ -1208,10 +1810,10 @@ def _check_and_run_special_tasks(d, current_time_str):
                             except:
                                 pass
                         recs_with_zdf.append((c, n, i, zdf, zdf_val))
-                        
+
                     # 按照涨幅降序排序
                     recs_with_zdf.sort(key=lambda x: x[4], reverse=True)
-                    
+
                     # 格式化输出行，包含涨幅
                     lines_6 = []
                     for c, n, i, zdf, _ in recs_with_zdf:
@@ -1244,11 +1846,23 @@ def _ensure_scoring_table(db_table):
                     score_part3 INT DEFAULT 0 COMMENT '第三部分得分(综合条件,满分130)',
                     part4_category VARCHAR(100) COMMENT '第四部分分类(股价上涨逻辑1-6类)',
                     score_part5 INT DEFAULT 0 COMMENT '第五部分得分(翻倍股,满分100)',
+                    total_score INT DEFAULT 0 COMMENT '综合评分=P1+P3+P5-P2',
+                    rating VARCHAR(20) DEFAULT '' COMMENT '综合评级(SS/S/A/B/C/D级)',
                     analysis_detail TEXT COMMENT '分析详情',
                     update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     UNIQUE KEY uk_code_date (code, report_date)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='个股超级龙头+泡沫+翻倍股综合评分表(V2)';
             """)
+            # 兼容已建表：如果旧表没有 total_score/rating 字段则自动追加
+            try:
+                cursor.execute(f"SHOW COLUMNS FROM {db_table} LIKE 'total_score'")
+                if not cursor.fetchone():
+                    cursor.execute(f"ALTER TABLE {db_table} ADD COLUMN total_score INT DEFAULT 0 COMMENT '综合评分=P1+P3+P5-P2' AFTER score_part5")
+                cursor.execute(f"SHOW COLUMNS FROM {db_table} LIKE 'rating'")
+                if not cursor.fetchone():
+                    cursor.execute(f"ALTER TABLE {db_table} ADD COLUMN rating VARCHAR(20) DEFAULT '' COMMENT '综合评级(SS/S/A/B/C/D级)' AFTER total_score")
+            except Exception as alter_e:
+                print(f"[monitor_tdx] Warning altering v2 table for new columns: {alter_e}", flush=True)
         else:
             # 老标准表：保持原结构
             cursor.execute(f"""
@@ -1320,18 +1934,22 @@ def _run_doubao_scoring_session(d, actual_path, scoring_standard, db_table,
                             with open(actual_path, 'r', encoding='gb18030', errors='ignore') as f:
                                 raw_lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('9')]
 
-                        # 从数据库读取一个月内已存在的股票并过滤
-                        thirty_days_ago = (datetime.strptime(d, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
+                        # 从数据库读取7天内已存在的股票并过滤（受 ENABLE_30DAY_FILTER 开关控制）
                         existing_codes = set()
-                        try:
-                            from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
-                            filter_conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-                            filter_cursor = filter_conn.cursor()
-                            filter_cursor.execute(f"SELECT code FROM {db_table} WHERE report_date >= %s", (thirty_days_ago,))
-                            existing_codes = {row[0] for row in filter_cursor.fetchall()}
-                            filter_conn.close()
-                        except Exception as filter_e:
-                            print(f"[monitor_tdx] [{standard_label}] Warning: Failed to query existing codes for filtering: {filter_e}", flush=True)
+                        if ENABLE_30DAY_FILTER:
+                            seven_days_ago = (datetime.strptime(d, "%Y%m%d") - timedelta(days=7)).strftime("%Y%m%d")
+                            try:
+                                from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+                                filter_conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+                                filter_cursor = filter_conn.cursor()
+                                filter_cursor.execute(f"SELECT code FROM {db_table} WHERE report_date >= %s", (seven_days_ago,))
+                                existing_codes = {row[0] for row in filter_cursor.fetchall()}
+                                filter_conn.close()
+                                print(f"[monitor_tdx] [{standard_label}] 7天过滤已启用，跳过 {len(existing_codes)} 只已评估股票", flush=True)
+                            except Exception as filter_e:
+                                print(f"[monitor_tdx] [{standard_label}] Warning: Failed to query existing codes for filtering: {filter_e}", flush=True)
+                        else:
+                            print(f"[monitor_tdx] [{standard_label}] 7天过滤已关闭，所有股票将重新评估", flush=True)
 
                         # v2 模式：解析出 现价/流通市值 等字段
                         if db_table == "stock_deep_analysis_v2":
@@ -1384,13 +2002,13 @@ def _run_doubao_scoring_session(d, actual_path, scoring_standard, db_table,
                                     continue
                                 lines.append(line)
 
-                        print(f"[monitor_tdx] [{standard_label}] Read {len(raw_lines)} lines, after filtering 30-day existing codes, {len(lines)} lines remaining.", flush=True)
+                        print(f"[monitor_tdx] [{standard_label}] Read {len(raw_lines)} lines, after filtering 7-day existing codes, {len(lines)} lines remaining.", flush=True)
                         if not lines:
-                            print(f"[monitor_tdx] [{standard_label}] All stocks already processed in the last 30 days. Skipping.", flush=True)
+                            print(f"[monitor_tdx] [{standard_label}] All stocks already processed in the last 7 days. Skipping.", flush=True)
                             return False
 
-                        batch_size = 1 if db_table == "stock_deep_analysis_v2" else 5
-                        resend_every = 10 if db_table == "stock_deep_analysis_v2" else 50
+                        batch_size = 3 if db_table == "stock_deep_analysis_v2" else 5
+                        resend_every = 21 if db_table == "stock_deep_analysis_v2" else 50
                         db_txt_prefix = "新数据库" if db_table == "stock_deep_analysis_v2" else "数据库"
                         db_txt_path = os.path.join(VMWARE_SHARED_LOG_DIR, f"{db_txt_prefix}{d}.txt")
 
@@ -1508,6 +2126,9 @@ def _run_doubao_scoring_session(d, actual_path, scoring_standard, db_table,
                                     bottom_pos5 = sorted(all_pos5, key=lambda p: p.top, reverse=True)[0]
                                     center_x = bottom_pos5.left + bottom_pos5.width / 2
                                     center_y = bottom_pos5.top + bottom_pos5.height / 2
+                                    # 边界保护：避开屏幕角落 fail-safe 区（pyautogui 在角落会抛异常）
+                                    center_x = max(10, min(center_x, pag.size().width - 10))
+                                    center_y = max(10, min(center_y, pag.size().height - 10))
 
                                     pag.moveTo(center_x, center_y, 0.5)
                                     pag.click()
@@ -1525,6 +2146,11 @@ def _run_doubao_scoring_session(d, actual_path, scoring_standard, db_table,
                                         if not _ensure_click(IMG_DOUBAO3_6, retries=2, confidence=0.8, move_time=0.5):
                                             _ensure_click(IMG_DOUBAO3_7, retries=2, confidence=0.8, move_time=0.5)
                                     print(f"[monitor_tdx] [{standard_label}] Refocused input box for next batch.", flush=True)
+
+                                    # 新标准下每批次之间停顿5秒，降低被风控概率
+                                    if db_table == "stock_deep_analysis_v2":
+                                        print(f"[monitor_tdx] [{standard_label}] Pausing 5.00s before next batch...", flush=True)
+                                        time.sleep(5)
                                 else:
                                     print(f"[monitor_tdx] [{standard_label}] Error: Failed to find doubao5.png on screen", flush=True)
                             except Exception as e:
@@ -1696,9 +2322,25 @@ def _run_doubao_scoring_session(d, actual_path, scoring_standard, db_table,
                                                     part4_col = next((c for c in cols if '第四部分' in c), None)
                                                     part4_category = str(row[part4_col]).strip() if part4_col and pd.notna(row[part4_col]) else ''
 
+                                                    # 计算综合评分和评级
+                                                    # 总分 = 第一部分(100) + 第三部分(130) + 第五部分(100) - 第二部分(100)
+                                                    total_score = score_part1 + score_part3 + score_part5 - score_part2
+                                                    if total_score >= 350:
+                                                        rating = 'SS级'
+                                                    elif total_score >= 300:
+                                                        rating = 'S级'
+                                                    elif total_score >= 250:
+                                                        rating = 'A级'
+                                                    elif total_score >= 200:
+                                                        rating = 'B级'
+                                                    elif total_score >= 150:
+                                                        rating = 'C级'
+                                                    else:
+                                                        rating = 'D级'
+
                                                     sql = f'''
-                                                        INSERT INTO {db_table} (report_date, code, name, score_part1, score_part2, score_part3, part4_category, score_part5, analysis_detail)
-                                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                        INSERT INTO {db_table} (report_date, code, name, score_part1, score_part2, score_part3, part4_category, score_part5, total_score, rating, analysis_detail)
+                                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                                         ON DUPLICATE KEY UPDATE
                                                             name = IF(VALUES(name) != '', VALUES(name), name),
                                                             score_part1 = IF(VALUES(score_part1) > 0, VALUES(score_part1), score_part1),
@@ -1706,9 +2348,11 @@ def _run_doubao_scoring_session(d, actual_path, scoring_standard, db_table,
                                                             score_part3 = IF(VALUES(score_part3) > 0, VALUES(score_part3), score_part3),
                                                             part4_category = IF(VALUES(part4_category) != '', VALUES(part4_category), part4_category),
                                                             score_part5 = IF(VALUES(score_part5) > 0, VALUES(score_part5), score_part5),
+                                                            total_score = VALUES(total_score),
+                                                            rating = VALUES(rating),
                                                             analysis_detail = IF(VALUES(analysis_detail) != '', VALUES(analysis_detail), analysis_detail)
                                                     '''
-                                                    cursor.execute(sql, (d, code, name, score_part1, score_part2, score_part3, part4_category, score_part5, detail))
+                                                    cursor.execute(sql, (d, code, name, score_part1, score_part2, score_part3, part4_category, score_part5, total_score, rating, detail))
                                                 else:
                                                     # 老标准：综合评级 + 综合评分
                                                     score_col = next((c for c in cols if '分' in c), None)
@@ -1783,7 +2427,11 @@ def run_once():
     # 先等待到第一个趋势分析发送时点，再执行近 10 个交易日实时新高趋势分析
     if not FORCE_SCORING_NOW:
         _wait_for_market_start(min(NEW_HIGH_ANALYSIS_TIMES))
+        # 1. 新高趋势分析（8:00 / 14:40 触发，内部去重）
         _check_and_send_new_high_analysis()
+        # 2. 早盘宏观流程（紧跟新高分析后顺序执行：豆包抓取 → 宏观研判 → 发微信）
+        #    用日期 key 去重，每天只执行一次，14:40 新高分析后不会重复跑
+        _run_morning_macro_flow(d)
 
         # 再等待到开盘前启动时间
         _wait_for_market_start(MARKET_START_TIME)
@@ -1868,7 +2516,7 @@ def run_once():
             conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
             cursor = conn.cursor(pymysql.cursors.DictCursor)
             
-            for code, name, industry in recs:
+            for code, name, industry, *_ in recs:
                 # 检查业绩预告
                 cursor.execute("SELECT reason FROM earnings_forecast WHERE code=%s AND report_date=%s", (code, report_date))
                 f_row = cursor.fetchone()
@@ -1953,13 +2601,13 @@ def run_once():
                                 with open(actual_path, 'r', encoding='gb18030', errors='ignore') as f:
                                     raw_lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('9')]
 
-                            # 增加逻辑：从数据库读取一个月内已存在的股票并过滤
-                            thirty_days_ago = (datetime.strptime(d, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
+                            # 增加逻辑：从数据库读取7天内已存在的股票并过滤
+                            seven_days_ago = (datetime.strptime(d, "%Y%m%d") - timedelta(days=7)).strftime("%Y%m%d")
                             existing_codes = set()
                             try:
                                 filter_conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
                                 filter_cursor = filter_conn.cursor()
-                                filter_cursor.execute("SELECT code FROM stock_deep_analysis WHERE report_date >= %s", (thirty_days_ago,))
+                                filter_cursor.execute("SELECT code FROM stock_deep_analysis WHERE report_date >= %s", (seven_days_ago,))
                                 existing_codes = {row[0] for row in filter_cursor.fetchall()}
                                 filter_conn.close()
                             except Exception as filter_e:
@@ -1975,9 +2623,9 @@ def run_once():
                                     continue
                                 lines.append(line)
 
-                            print(f"[monitor_tdx] Read {len(raw_lines)} lines, after filtering 30-day existing codes, {len(lines)} lines remaining to process.", flush=True)
+                            print(f"[monitor_tdx] Read {len(raw_lines)} lines, after filtering 7-day existing codes, {len(lines)} lines remaining to process.", flush=True)
                             if not lines:
-                                print("[monitor_tdx] All stocks already processed in the last 30 days. Skipping Doubao interaction.", flush=True)
+                                print("[monitor_tdx] All stocks already processed in the last 7 days. Skipping Doubao interaction.", flush=True)
                                 # 标记今日下午任务已完成并退出本次 GUI 交互逻辑
                                 afternoon_task_done_date = d
                                 return
@@ -2110,6 +2758,9 @@ def run_once():
                                         bottom_pos5 = sorted(all_pos5, key=lambda p: p.top, reverse=True)[0]
                                         center_x = bottom_pos5.left + bottom_pos5.width / 2
                                         center_y = bottom_pos5.top + bottom_pos5.height / 2
+                                        # 边界保护：避开屏幕角落 fail-safe 区（pyautogui 在角落会抛异常）
+                                        center_x = max(10, min(center_x, pag.size().width - 10))
+                                        center_y = max(10, min(center_y, pag.size().height - 10))
 
                                         pag.moveTo(center_x, center_y, 0.5)
                                         pag.click()
@@ -2343,11 +2994,11 @@ def run_once():
             
         if msg:
             send_wechat_message(msg)
-        baseline_codes = {c for c, _, _, _ in recs}
+        baseline_codes = {c for c, *_ in recs}
         return
-        
+
     # 对比逻辑：找出当前 recs 中存在但 baseline_codes 中不存在的股票
-    new_recs = [(c, n, i, zdf) for c, n, i, zdf in recs if c not in baseline_codes]
+    new_recs = [r for r in recs if r[0] not in baseline_codes]
     
     if new_recs:
         print(f"[monitor_tdx] Detected {len(new_recs)} new high records!", flush=True)
@@ -2360,7 +3011,7 @@ def run_once():
             msg = f"{msg}\n\n--- 行业聚集提醒 ---\n{cluster_msg}"
             
         # 更新基准，将新增的股票加入（先更新内存，防止发送失败或耗时过长导致下一轮重复）
-        for c, _, _, _ in new_recs:
+        for c, *_ in new_recs:
             baseline_codes.add(c)
             
         if msg:
@@ -2388,11 +3039,30 @@ def _cli():
     parser.add_argument("--once", action="store_true")
     # 移除 --interval 的默认长等待，改为 1 秒极短缓冲
     parser.add_argument("--interval", type=int, default=1)
+    # 手动触发：通过豆包抓取当天宏观市场数据（美债+原油+铜）→ 落文件 → 入库
+    parser.add_argument("--macro-market-data", action="store_true",
+                        help="通过豆包抓取当天宏观市场数据(美债/原油/铜)并入库")
+    # 可选指定日期 YYYYMMDD（默认今天）
+    parser.add_argument("--date", type=str, default=None,
+                        help="指定日期 YYYYMMDD，默认今天（仅 --macro-market-data 时生效）")
     args = parser.parse_args()
     try:
         os.chdir(os.path.dirname(__file__))
     except Exception:
         pass
+    if args.macro_market_data:
+        d = args.date or datetime.now().strftime("%Y%m%d")
+        print(f"[monitor_tdx] mode=macro-market-data, date={d}", flush=True)
+        try:
+            ok = _fetch_macro_market_data_via_doubao(d)
+            print(f"[monitor_tdx] [macro_market_data] result: {'OK' if ok else 'FAIL'}", flush=True)
+            if ok:
+                _run_macro_oil_analysis_and_print()
+        except Exception as e:
+            import traceback
+            print(f"[monitor_tdx] error: {e}", flush=True)
+            traceback.print_exc()
+        return
     if args.once:
         print("[monitor_tdx] mode=once", flush=True)
         try:
