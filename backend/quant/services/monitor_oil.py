@@ -1315,7 +1315,11 @@ def main():
 
     save_signal_to_db(trade_date, signal_res, summary_text)
     print(summary_text)
-    print(f"✅ {trade_date}宏观研判完成并入库")
+    # 完成提示：控制台可能为 GBK 编码，emoji 打印失败不应影响 summary_text 的返回
+    try:
+        print(f"✅ {trade_date}宏观研判完成并入库")
+    except Exception:
+        print(f"[OK] {trade_date}宏观研判完成并入库")
     return summary_text
 
 

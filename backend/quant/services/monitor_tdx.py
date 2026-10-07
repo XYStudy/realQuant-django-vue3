@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pyautogui as pag
 import pandas as pd
 try:
@@ -14,9 +14,22 @@ import pymysql
 import re
 import json
 try:
+    import redis as _redis
+except Exception:
+    _redis = None
+try:
     from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
 except ImportError:
     pass
+
+# ================= Redis 配置（宿主机局域网IP） =================
+# 启动时先连 Redis，从中读取“宿主机局域网 IP”，再用该 IP 连接宿主机 MySQL。
+REDIS_HOST = "192.168.1.6"
+REDIS_PORT = 16379            # docker 容器映射端口，避开 NAS 系统 redis 占用的 6379
+REDIS_PASSWORD = "DevRedis@2026"
+REDIS_DB = 0
+# Redis 中存放“宿主机局域网 IP”的 key（如与实际不一致，改这里即可）
+REDIS_HOST_IP_KEY = "tdx:server:ip"
 
 try:
     from quant.services.auto_analyzer import send_wechat_message
@@ -98,6 +111,14 @@ MORNING_NEW_HIGH_ANALYSIS_DAYS = 10
 # 总开关：False = 暂时禁用（仍可 --macro-market-data 手动触发）
 ENABLE_MACRO_MARKET_DATA_VIA_DOUBAO = True
 
+# ===== 事件日历流程（紧跟早盘宏观流程后顺序执行） =====
+# 豆包抓取重要宏观事件日程（美/日/欧议息、美国CPI/PPI/非农）→ 入库 macro_event_calendar
+# → 从库读取 → 与今天对比（≤EVENT_CALENDAR_ALERT_DAYS 天的事件单独⚠提示）→ 发送微信
+# 总开关：False = 暂时禁用（仍可 --event-calendar 手动触发）
+ENABLE_EVENT_CALENDAR_VIA_DOUBAO = True
+# 临近提示阈值（天）：事件距今天数 ≤ 该值时，在微信消息中单独提示"距离XX还有N天"
+EVENT_CALENDAR_ALERT_DAYS = 3
+
 # 每天这些整点会尝试发送一次“今日操作建议”。
 ADVICE_HOURS = [10, 11, 13, 14]
 # 整点后的有效触发窗口，超过这个分钟数就不再补发。
@@ -107,6 +128,15 @@ ADVICE_TRIGGER_WINDOW_MINUTES = 15
 QBD_TASK_TIMES = ["09:45", "10:00", "10:15", "10:30", "11:00", "11:15", "13:30", "14:00", "14:30"]
 # ETF 任务时间：到点后导出 `tab6`，并发送“距离新高5%以内ETF”消息。
 ETF_TASK_TIMES = ["10:00", "11:00", "13:30", "14:30"]
+# ETF 任务开关：False 时跳过新高ETF逻辑（暂不执行 tab6 导出与发送）
+ENABLE_ETF_TASK = False
+
+# 平台筛选任务时间：到点后从 platform_filter_daily 表读取 sectors 并发送到微信。
+PLATFORM_FILTER_TASK_TIMES = ["13:50"]
+# 平台筛选任务开关
+ENABLE_PLATFORM_FILTER_TASK = True
+# 平台筛选只发送命中率前 N 的板块
+PLATFORM_FILTER_TOP_N = 20
 # 如果脚本重启后发现已经超过任务时间这么多分钟，则跳过该时间点，避免补跑过期任务。
 SPECIAL_TASK_EXPIRE_MINUTES = 10
 
@@ -135,6 +165,8 @@ last_advice_sent_time = None
 new_high_analysis_sent_keys = set()
 # 早盘宏观流程去重：f"{日期}_macro"，每天只执行一次（08:00 新高分析后触发）
 macro_market_data_sent_keys = set()
+# 事件日历流程去重：f"{日期}_event_calendar"，每天只执行一次（宏观研判后触发）
+event_calendar_sent_keys = set()
 
 SCORING_STANDARD = """个股评分标准（最终定稿版）
 一、终极判定：满足任一条件直接评为对应分数及评级，杜绝周期陷阱：
@@ -1197,6 +1229,10 @@ def _init_macro_market_data_table():
         print(f"[monitor_tdx] [macro_market_data] init table failed: {e}", flush=True)
         return False
 
+# 豆包发送提示词后的固定等待秒数：先等上一轮消息的结果标记失效、新一轮开始生成，
+# 再启动响应检测，避免立即检测时误匹配旧标记（曾把提示词模板当成回答复制回来）
+DOUBAO_RESPONSE_INITIAL_WAIT_SECONDS = 15
+
 def _send_msg_to_doubao_and_get_response(msg, max_wait_seconds=180):
     """
     向豆包发送一条消息并获取回复文本（复用现有 GUI 元素定位流程）。
@@ -1224,6 +1260,9 @@ def _send_msg_to_doubao_and_get_response(msg, max_wait_seconds=180):
     time.sleep(1.0)
     pag.press('enter')
     print("[monitor_tdx] [macro_market_data] Message sent to Doubao, waiting for response...", flush=True)
+
+    # 发送后先固定等待，再开始检测响应（防止误匹配上一轮消息残留的结果标记）
+    time.sleep(DOUBAO_RESPONSE_INITIAL_WAIT_SECONDS)
 
     # 等待结果就绪（doubao4.5.png）
     result_ready = False
@@ -1698,6 +1737,358 @@ def _run_macro_oil_analysis_and_print():
         except Exception:
             pass
 
+# ===================== 事件日历流程（宏观研判后顺序执行） =====================
+def _get_db_conn_local():
+    """局部获取 DB 连接（延迟导入，避免路径未初始化时顶层导入失败）。"""
+    try:
+        from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+        from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+    return pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+
+def _init_macro_event_calendar_table():
+    """初始化 macro_event_calendar 表。
+    - 豆包返回一个事件多个日期（如"美国议息会议":"2026-10-27,2026-10-28,2026-12-08"），
+      拆成多行存储：每行一个 (event_name, event_date)
+    - 日程每日全量刷新（DELETE 后整批写入），无历史保留需求，故 DROP+CREATE 保证结构一致
+    """
+    try:
+        conn = _get_db_conn_local()
+        cur = conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS macro_event_calendar")
+        cur.execute("""
+            CREATE TABLE macro_event_calendar (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+                event_name VARCHAR(128) NOT NULL COMMENT '事件名称',
+                event_date DATE NOT NULL COMMENT '事件日期(一个事件多日期拆多行)',
+                update_time DATETIME COMMENT '入库/更新时间',
+                UNIQUE KEY uk_name_date (event_name, event_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[monitor_tdx] [event_calendar] init table failed: {e}", flush=True)
+        return False
+
+def _parse_event_date(value_str):
+    """从豆包返回的字符串中解析日期，返回 datetime.date 或 None。
+    兼容格式：2026-09-16 / 2026年9月16日 / 2026/9/16 / 20260916 / 9月16日（按今年补全年份）
+    """
+    if not value_str:
+        return None
+    s = str(value_str).strip()
+    # 带年份：2026-09-16 / 2026年9月16日 / 2026/9/16 / 2026.9.16
+    m = re.search(r'(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})\s*日?', s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    # 紧凑格式：20260916
+    m = re.search(r'\b(\d{4})(\d{2})(\d{2})\b', s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    # 无年份：9月16日（按今年补全；若已过去超30天则视为明年）
+    m = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*日', s)
+    if m:
+        try:
+            dt = date(datetime.now().year, int(m.group(1)), int(m.group(2)))
+            if (date.today() - dt).days > 30:
+                dt = date(dt.year + 1, dt.month, dt.day)
+            return dt
+        except ValueError:
+            return None
+    return None
+
+def _parse_event_dates(value_str):
+    """解析事件 value 中的多个日期（豆包返回如 "2026-10-27,2026-10-28,2026-12-08"）。
+    分隔符兼容：英文逗号/中文逗号/顿号/分号/空格/~/～/至
+    返回去重升序的 list[date]
+    """
+    if not value_str:
+        return []
+    tokens = re.split(r'[,，、;；\s~～至]+', str(value_str).strip())
+    dates = []
+    for tk in tokens:
+        dt = _parse_event_date(tk)
+        if dt and dt not in dates:
+            dates.append(dt)
+    return sorted(dates)
+
+def _clean_ai_disclaimer(text):
+    """清理豆包返回中的 AI 免责声明（如 "> 本回答由AI生成，仅供参考，请仔细甄别，谨慎投资。"），不录入库。
+    - 整行以 > 开头的引用式声明 → 删除整行
+    - 行内出现的免责短语 → 删除
+    """
+    if not text:
+        return text
+    text = "\n".join(ln for ln in str(text).splitlines() if not ln.strip().startswith(">"))
+    for phrase in ("本回答由AI生成，仅供参考，请仔细甄别，谨慎投资。",
+                   "本回答由 AI 生成，仅供参考，请仔细甄别，谨慎投资。"):
+        text = text.replace(phrase, "")
+    return text.strip()
+
+def _fetch_event_calendar_via_doubao(d):
+    """
+    通过豆包抓取重要宏观事件日程（美/日/欧议息、美国CPI/PPI/非农）。
+    流程：发送提示词 → 解析单层 JSON → 落文件到 VMWARE_SHARED_LOG_DIR → 清空并写入 macro_event_calendar。
+    参数 d: 日期字符串 YYYYMMDD
+    返回 True/False
+    """
+    date_cn = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    prompt = (
+        f"【任务说明】\n"
+        f"获取美国议息会议、美国 PPI 发布、美国 CPI 发布、美国非农就业、日本议息会议、欧洲议息会议的最新日程，"
+        f"输出每项事件对应的具体年月日。\n"
+        f"【输出强制约束】\n"
+        f"仅返回单层 JSON 对象，不要数组、不要 impact 字段，无额外文本，key 为事件名称，value 为字符串；\n"
+        f"同一事件有多个日期时（如多轮议息会议、多月数据发布），用英文逗号分隔，统一 YYYY-MM-DD 格式（如 2026-09-16）；\n"
+        f"仅填日期，不要附加星期或其他文字；\n"
+        f"禁止 markdown 代码块标记、禁止任何前置后置解释；日程必须为真实最新日程，禁止编造。\n"
+        f"【输出 Schema 模板，严格复用该结构】\n"
+        f"{{\n"
+        f'  "美国议息会议": "YYYY-MM-DD,YYYY-MM-DD",\n'
+        f'  "美国PPI发布": "YYYY-MM-DD,YYYY-MM-DD",\n'
+        f'  "美国CPI发布": "YYYY-MM-DD,YYYY-MM-DD",\n'
+        f'  "美国非农就业": "YYYY-MM-DD,YYYY-MM-DD",\n'
+        f'  "日本议息会议": "YYYY-MM-DD,YYYY-MM-DD",\n'
+        f'  "欧洲议息会议": "YYYY-MM-DD,YYYY-MM-DD"\n'
+        f"}}"
+    )
+
+    print(f"[monitor_tdx] [event_calendar] Sending prompt to Doubao for {date_cn}...", flush=True)
+    raw_text, err = _send_msg_to_doubao_and_get_response(prompt, max_wait_seconds=180)
+    if not raw_text:
+        print(f"[monitor_tdx] [event_calendar] Failed: {err}", flush=True)
+        return False
+
+    # 清理豆包尾部 AI 免责声明（"> 本回答由AI生成..."），该内容不录入
+    raw_text = _clean_ai_disclaimer(raw_text)
+    print(f"[monitor_tdx] [event_calendar] Got response (len={len(raw_text)}), parsing JSON...", flush=True)
+
+    # 优先整体解析；失败则尝试 markdown 代码块、再退化到贪婪 { } 匹配（与宏观数据抓取一致）
+    json_obj = None
+    try:
+        json_obj = json.loads(raw_text)
+    except Exception:
+        pass
+    if not json_obj or not isinstance(json_obj, dict):
+        m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_text, re.DOTALL)
+        if m:
+            try:
+                json_obj = json.loads(m.group(1))
+            except Exception:
+                pass
+    if not json_obj or not isinstance(json_obj, dict):
+        m = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if m:
+            try:
+                json_obj = json.loads(m.group(0))
+            except Exception:
+                pass
+
+    if not json_obj or not isinstance(json_obj, dict):
+        print(f"[monitor_tdx] [event_calendar] JSON parse failed, raw head: {raw_text[:500]}", flush=True)
+        return False
+
+    # 1. 落文件到 VMWARE_SHARED_LOG_DIR/宏观时间节点YYYYMMDD.json
+    try:
+        if not os.path.exists(VMWARE_SHARED_LOG_DIR):
+            os.makedirs(VMWARE_SHARED_LOG_DIR, exist_ok=True)
+        file_path = os.path.join(VMWARE_SHARED_LOG_DIR, f"宏观时间节点{d}.json")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(json_obj, f, ensure_ascii=False, indent=2)
+        print(f"[monitor_tdx] [event_calendar] Saved to {file_path}", flush=True)
+    except Exception as e:
+        print(f"[monitor_tdx] [event_calendar] Warning: failed to save file: {e}", flush=True)
+
+    # 2. 入库（每日全量刷新：重建表 + DELETE 旧日程 + 整批写入；一个事件多日期拆多行）
+    try:
+        _init_macro_event_calendar_table()
+        conn = _get_db_conn_local()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM macro_event_calendar")
+        date_rows = 0
+        for name, value in json_obj.items():
+            name = str(name).strip()
+            if not name or value is None:
+                continue
+            value = _clean_ai_disclaimer(str(value).strip())
+            if not value:
+                continue
+            dates = _parse_event_dates(value)
+            if not dates:
+                print(f"[monitor_tdx] [event_calendar] Warning: 无法解析日期: {name} = {value[:50]}", flush=True)
+                continue
+            for ev_date in dates:
+                cur.execute(
+                    "INSERT INTO macro_event_calendar (event_name, event_date, update_time) "
+                    "VALUES (%s, %s, NOW())",
+                    (name, ev_date))
+                date_rows += 1
+        conn.commit()
+        conn.close()
+        print(f"[monitor_tdx] [event_calendar] DB refreshed for {date_cn} (date_rows={date_rows})", flush=True)
+        return date_rows > 0
+    except Exception as e:
+        print(f"[monitor_tdx] [event_calendar] DB error: {e}", flush=True)
+        return False
+
+def _is_event_calendar_updated_today():
+    """查询 macro_event_calendar 是否今天已更新（MAX(update_time) 为今天）。
+    返回 True=今天已更新（跳过抓取），False=未更新或查询失败。
+    """
+    try:
+        conn = _get_db_conn_local()
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(update_time) FROM macro_event_calendar")
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0] and row[0].date() == date.today():
+            return True
+        return False
+    except Exception as e:
+        print(f"[monitor_tdx] [event_calendar] DB check failed: {e}", flush=True)
+        return False
+
+def _send_event_calendar_to_wechat():
+    """从 macro_event_calendar 读取最新日程，构建消息并发送微信。
+    - 每个事件：名称占一行，其下每个日期单独一行（连续日期合并为区间，如 10-27~10-28 两日议息），最近一次标注距今天数
+    - 事件按最近 upcoming 日期升序；全部已过的事件排最后
+    - 最近日期 ≤ EVENT_CALENDAR_ALERT_DAYS 天的事件单独 ⚠ 提示：距离XX还有N天，请做好相应的应对措施
+    返回 True/False
+    """
+    try:
+        conn = _get_db_conn_local()
+        cur = conn.cursor()
+        cur.execute("SELECT event_name, event_date, update_time FROM macro_event_calendar")
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[monitor_tdx] [event_calendar] read DB failed: {e}", flush=True)
+        return False
+
+    if not rows:
+        print("[monitor_tdx] [event_calendar] 表为空，跳过微信发送", flush=True)
+        return False
+
+    today = date.today()
+    events = {}  # name -> list[date]
+    last_update = None
+    for name, ev_date, update_time in rows:
+        if update_time and (last_update is None or update_time > last_update):
+            last_update = update_time
+        if ev_date is None:
+            continue
+        events.setdefault(name, []).append(ev_date)
+
+    if not events:
+        print("[monitor_tdx] [event_calendar] 无有效日程数据，跳过微信发送", flush=True)
+        return False
+
+    # 连续日期合并为区间：[10-27, 10-28] → "2026-10-27~10-28"（两日议息会议）
+    def merge_ranges(dates):
+        dates = sorted(set(dates))
+        ranges = []
+        for dt in dates:
+            if ranges and (dt - ranges[-1][1]).days == 1:
+                ranges[-1][1] = dt
+            else:
+                ranges.append([dt, dt])
+        return ranges
+
+    def fmt_range(rng):
+        s, e = rng
+        return s.strftime('%Y-%m-%d') if s == e else f"{s.strftime('%Y-%m-%d')}~{e.strftime('%m-%d')}"
+
+    # 每个事件：区间列表 + 最近 upcoming 日期（驱动排序与临近提示）
+    event_infos = []
+    for name, dates in events.items():
+        ranges = merge_ranges(dates)
+        upcoming = [dt for dt in dates if dt >= today]
+        event_infos.append((name, ranges, min(upcoming) if upcoming else None))
+    # 有 upcoming 的按最近日期升序在前，全部已过的排最后
+    event_infos.sort(key=lambda x: (x[2] is None, x[2] or today))
+
+    lines = ["【重要宏观时间节点】"]
+    if last_update:
+        lines.append(f"数据更新：{last_update.strftime('%Y-%m-%d %H:%M')}")
+    lines.append("")
+
+    if event_infos:
+        lines.append("--- 事件日程 ---")
+        alert_lines = []
+        for name, ranges, nxt in event_infos:
+            # 事件名称一行；其下每个日期（区间）单独一行
+            lines.append(f"{name}：" if nxt is not None else f"{name}：（均已过去）")
+            for r in ranges:
+                seg = fmt_range(r)
+                if nxt is not None and r[0] <= nxt <= r[1]:
+                    days = (nxt - today).days
+                    seg += "（今天）" if days == 0 else f"（还有{days}天）"
+                lines.append(seg)
+            if nxt is not None:
+                days = (nxt - today).days
+                if days == 0:
+                    alert_lines.append(f"⚠️ {name} 就是今天，请做好相应的应对措施")
+                elif days <= EVENT_CALENDAR_ALERT_DAYS:
+                    alert_lines.append(f"⚠️ 距离{name}还有{days}天，请做好相应的应对措施")
+        lines.append("")
+
+        lines.append(f"--- {EVENT_CALENDAR_ALERT_DAYS}天内临近提示 ---")
+        if alert_lines:
+            lines.extend(alert_lines)
+        else:
+            lines.append(f"未来{EVENT_CALENDAR_ALERT_DAYS}天内暂无临近事件")
+
+    msg = "\n".join(lines)
+    send_wechat_message(msg)
+    print(f"[monitor_tdx] [event_calendar] 日历消息已发送至微信 @ {datetime.now().strftime('%H:%M:%S')}", flush=True)
+    return True
+
+def _run_event_calendar_flow(d):
+    """
+    事件日历流程（08:00 宏观研判后顺序调用）：
+    1. 豆包抓取重要宏观事件日程 → 入库 macro_event_calendar
+    2. 从库读取 → 与今天对比 → 3天内临近事件单独提示 → 发送微信
+    去重：
+      - 内存 set（{日期}_event_calendar）防止同一次运行内重复进入
+      - 库内 MAX(update_time) 为今天则跳过抓取（程序重启后不重复抓取/发送）
+    """
+    if not ENABLE_EVENT_CALENDAR_VIA_DOUBAO:
+        return False
+    key = f"{d}_event_calendar"
+    if key in event_calendar_sent_keys:
+        return False
+
+    # 今天已更新过日历则跳过（重启后也能正确跳过）
+    if _is_event_calendar_updated_today():
+        print(f"[monitor_tdx] [event_calendar] DB already updated today, skip event calendar flow.", flush=True)
+        event_calendar_sent_keys.add(key)
+        return False
+
+    event_calendar_sent_keys.add(key)  # 提前去重，防止主循环重复进入
+
+    print(f"[monitor_tdx] ===== 事件日历流程开始 @ {datetime.now().strftime('%H:%M:%S')} =====", flush=True)
+    ok = _fetch_event_calendar_via_doubao(d)
+    print(f"[monitor_tdx] [event_calendar] fetch done, ok={ok}", flush=True)
+
+    # 无论抓取是否成功，都尝试从库读取发送（库内有旧日程时依然有效，日期不会过期失效）
+    try:
+        _send_event_calendar_to_wechat()
+    except Exception as e:
+        print(f"[monitor_tdx] [event_calendar] send wechat failed: {e}", flush=True)
+
+    print(f"[monitor_tdx] ===== 事件日历流程结束 @ {datetime.now().strftime('%H:%M:%S')} =====", flush=True)
+    return True
+
 def _check_and_send_advice():
     """
     检查是否需要在整点发送今日操作建议
@@ -1758,26 +2149,136 @@ def _run_export_and_read(target_tab, export_prefix, d):
 
 special_tasks_done = set()
 
+def _compose_platform_filter_msg(d):
+    """从 platform_filter_daily 读取当日 sectors，关联 stock_deep_analysis_buffett 的评分，组装微信消息。
+    返回 None 表示当日无数据。"""
+    from quant.services.performance_analysis import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+    conn = pymysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, database=DB_NAME, charset='utf8mb4')
+    try:
+        cursor = conn.cursor()
+        # 探测日期字段名（优先 trade_date，其次 report_date / date）
+        cursor.execute("SHOW COLUMNS FROM platform_filter_daily")
+        cols = [row[0] for row in cursor.fetchall()]
+        date_col = next((c for c in ['trade_date', 'report_date', 'date', 'filter_date'] if c in cols), None)
+        if 'sectors' not in cols:
+            print("[monitor_tdx] platform_filter_daily 表缺少 sectors 字段", flush=True)
+            return None
+
+        row = None
+        if date_col:
+            # 兼容日期格式 '20261007' 或 '2026-10-07'
+            d_dash = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            cursor.execute(
+                f"SELECT sectors FROM platform_filter_daily WHERE {date_col} IN (%s, %s) ORDER BY {date_col} DESC LIMIT 1",
+                (d, d_dash))
+            row = cursor.fetchone()
+        if not row:
+            # 兜底：取最新一条
+            cursor.execute("SELECT sectors FROM platform_filter_daily ORDER BY id DESC LIMIT 1")
+            row = cursor.fetchone()
+        if not row or not row[0]:
+            print(f"[monitor_tdx] platform_filter_daily 无 {d} 的数据", flush=True)
+            return None
+
+        sectors_raw = row[0]
+        sectors = json.loads(sectors_raw) if isinstance(sectors_raw, str) else sectors_raw
+        if not sectors:
+            return None
+
+        # 收集所有股票代码（去掉 .SH/.SZ 后缀），批量查询 buffett 评分
+        def _pure_code(c):
+            return re.sub(r'\D', '', str(c))[-6:]
+
+        all_codes = []
+        for sec in sectors:
+            for st in (sec.get('stocks') or []):
+                pc = _pure_code(st.get('code', ''))
+                if pc:
+                    all_codes.append(pc)
+        score_map = {}
+        if all_codes:
+            placeholders = ','.join(['%s'] * len(set(all_codes)))
+            cursor.execute(
+                f"SELECT code, total_score, rating FROM stock_deep_analysis_buffett WHERE code IN ({placeholders})",
+                list(set(all_codes)))
+            for r in cursor.fetchall():
+                score_map[r[0]] = (r[1], r[2])
+
+        # 按命中率降序，只取前 PLATFORM_FILTER_TOP_N 个板块
+        def _hit_ratio(sec):
+            try:
+                return float(sec.get('hit_ratio_pct', 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        sectors = sorted(sectors, key=_hit_ratio, reverse=True)
+        total_cnt = len(sectors)
+        if PLATFORM_FILTER_TOP_N > 0:
+            sectors = sectors[:PLATFORM_FILTER_TOP_N]
+
+        # 组装消息
+        lines = []
+        for sec in sectors:
+            sec_code = sec.get('code', '')
+            sec_name = sec.get('name', '')
+            hit_count = sec.get('hit_count', 0)
+            total = sec.get('total', 0)
+            hit_ratio = sec.get('hit_ratio_pct', 0)
+            lines.append(f"{sec_code} {sec_name} {hit_count}/{total} 命中率:{hit_ratio}%")
+            for st in (sec.get('stocks') or []):
+                st_code = _pure_code(st.get('code', ''))
+                st_name = st.get('name', '')
+                sc, rt = score_map.get(st_code, (None, None))
+                score_str = str(sc) if sc is not None else '-'
+                rating_str = rt if rt else '-'
+                lines.append(f"{st_code} {st_name} {score_str} {rating_str}")
+            lines.append("")  # 板块间空行分隔
+        return "\n".join(lines).strip()
+    finally:
+        conn.close()
+
+def _send_platform_filter_msg(d, t):
+    """平台筛选任务入口：组装并发送微信。"""
+    try:
+        msg = _compose_platform_filter_msg(d)
+        if msg:
+            final_msg = f"【平台筛选 {t} 命中率前{PLATFORM_FILTER_TOP_N}】\n{msg}"
+            print(f"[monitor_tdx] Platform filter msg len={len(final_msg)}, sending...", flush=True)
+            send_wechat_message(final_msg)
+            print(f"[monitor_tdx] Platform filter msg sent for {t}", flush=True)
+        else:
+            print(f"[monitor_tdx] Platform filter: no data for {d}, skip sending.", flush=True)
+    except Exception as e:
+        print(f"[monitor_tdx] Platform filter task error: {e}", flush=True)
+
 def _check_and_run_special_tasks(d, current_time_str):
     # 获取所有需要检查的时间点
-    all_times = sorted(list(set(ETF_TASK_TIMES + QBD_TASK_TIMES)))
+    all_times = sorted(list(set(ETF_TASK_TIMES + QBD_TASK_TIMES + PLATFORM_FILTER_TASK_TIMES)))
     now = datetime.now()
-    
+
     for t in all_times:
         t_hour, t_min = map(int, t.split(':'))
         target_time = now.replace(hour=t_hour, minute=t_min, second=0, microsecond=0)
         diff_minutes = (now - target_time).total_seconds() / 60.0
         
         if diff_minutes >= 0:
-            # 分别检查起爆点和ETF任务是否已执行
+            # 分别检查起爆点/ETF/平台筛选任务是否已执行
             qbd_key = f"{d}_qbd_{t}"
             etf_key = f"{d}_etf_{t}"
+            pf_key = f"{d}_pf_{t}"
             # 如果超过配置分钟数，说明是中途重启，跳过过去太久的任务
             if diff_minutes > SPECIAL_TASK_EXPIRE_MINUTES:
                 special_tasks_done.add(qbd_key)
                 special_tasks_done.add(etf_key)
+                special_tasks_done.add(pf_key)
                 continue
-            
+
+            # 3. 平台筛选
+            if ENABLE_PLATFORM_FILTER_TASK and t in PLATFORM_FILTER_TASK_TIMES and pf_key not in special_tasks_done:
+                print(f"\n[monitor_tdx] --- Running Platform Filter Task for {t} ---", flush=True)
+                _send_platform_filter_msg(d, t)
+                special_tasks_done.add(pf_key)
+                print(f"[monitor_tdx] --- Finished Platform Filter Task for {t} ---\n", flush=True)
+
             # 1. tab5: 起爆点
             if t in QBD_TASK_TIMES and qbd_key not in special_tasks_done:
                 print(f"\n[monitor_tdx] --- Running QBD Special Task for {t} ---", flush=True)
@@ -1795,7 +2296,7 @@ def _check_and_run_special_tasks(d, current_time_str):
                 print(f"[monitor_tdx] --- Finished QBD Special Task for {t} ---\n", flush=True)
                 
             # 2. tab6: 新高ETF
-            if t in ETF_TASK_TIMES and etf_key not in special_tasks_done:
+            if ENABLE_ETF_TASK and t in ETF_TASK_TIMES and etf_key not in special_tasks_done:
                 print(f"\n[monitor_tdx] --- Running ETF Special Task for {t} ---", flush=True)
                 print(f"[monitor_tdx] Processing tab6: 新高ETF", flush=True)
                 recs_6, _ = _run_export_and_read(IMG_TAB6, "新高ETF", d)
@@ -2418,6 +2919,69 @@ def _run_doubao_scoring_session(d, actual_path, scoring_standard, db_table,
     return True
 
 
+def _get_host_ip_from_redis():
+    """连接 Redis，从 REDIS_HOST_IP_KEY 读取宿主机局域网 IP。
+    成功返回 IP 字符串；失败返回 None（调用方回退到默认 DB_HOST）。
+    """
+    if _redis is None:
+        print("[monitor_tdx] redis 库未安装，无法从 Redis 获取宿主机 IP。", flush=True)
+        return None
+    try:
+        r = _redis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD,
+            db=REDIS_DB, socket_connect_timeout=5, socket_timeout=5,
+            decode_responses=True,
+        )
+        r.ping()
+        host_ip = r.get(REDIS_HOST_IP_KEY)
+        if host_ip:
+            host_ip = str(host_ip).strip()
+            # 兼容两种存储格式：纯 IP 字符串，或 JSON（如 {"ip": "192.168.1.12", ...}）
+            if host_ip.startswith("{"):
+                try:
+                    host_ip = str(json.loads(host_ip).get("ip", "")).strip()
+                except Exception as pe:
+                    print(f"[monitor_tdx] 解析 Redis 中 JSON 格式的宿主机 IP 失败: {pe}", flush=True)
+                    host_ip = ""
+            if host_ip:
+                print(f"[monitor_tdx] 从 Redis 获取宿主机 IP: {host_ip} (key={REDIS_HOST_IP_KEY})", flush=True)
+                return host_ip
+        print(f"[monitor_tdx] Redis 中未找到 key={REDIS_HOST_IP_KEY} 的宿主机 IP。", flush=True)
+        return None
+    except Exception as e:
+        print(f"[monitor_tdx] 连接 Redis 获取宿主机 IP 失败: {e}", flush=True)
+        return None
+
+
+def _init_db_host_from_redis():
+    """启动时调用：从 Redis 取宿主机 IP，写回 performance_analysis.DB_HOST，
+    使得本模块中所有 `from performance_analysis import DB_HOST` 的查询都连到宿主机 MySQL。
+    同时同步刷新 monitor_oil 的 DB_CONFIG（其 host 在模块加载时已固定为旧值，
+    仅写回 performance_analysis.DB_HOST 不会影响它），否则宏观研判仍连旧 IP。
+    """
+    host_ip = _get_host_ip_from_redis()
+    if not host_ip:
+        print("[monitor_tdx] 未能从 Redis 获取宿主机 IP，沿用默认 DB_HOST。", flush=True)
+        return None
+    try:
+        from quant.services import performance_analysis as _pa
+        _pa.DB_HOST = host_ip
+        print(f"[monitor_tdx] 已将 MySQL 连接 host 设置为宿主机 IP: {host_ip}", flush=True)
+    except Exception as e:
+        print(f"[monitor_tdx] 写回 DB_HOST 失败: {e}", flush=True)
+        return None
+    # 同步刷新 monitor_oil 的数据库连接配置
+    try:
+        if _macro_oil_mod is not None:
+            _macro_oil_mod.DB_HOST = host_ip
+            if hasattr(_macro_oil_mod, "DB_CONFIG") and isinstance(_macro_oil_mod.DB_CONFIG, dict):
+                _macro_oil_mod.DB_CONFIG["host"] = host_ip
+            print(f"[monitor_tdx] 已同步刷新 monitor_oil 的 MySQL host 为: {host_ip}", flush=True)
+    except Exception as e:
+        print(f"[monitor_tdx] 刷新 monitor_oil DB host 失败: {e}", flush=True)
+    return host_ip
+
+
 def run_once():
     global baseline_date, baseline_codes, afternoon_task_done_date
     
@@ -2432,6 +2996,9 @@ def run_once():
         # 2. 早盘宏观流程（紧跟新高分析后顺序执行：豆包抓取 → 宏观研判 → 发微信）
         #    用日期 key 去重，每天只执行一次，14:40 新高分析后不会重复跑
         _run_morning_macro_flow(d)
+        # 3. 事件日历流程（紧跟宏观研判后顺序执行：豆包抓日程 → 入库 → 读库 → 发微信 + 临近提示）
+        #    用日期 key 去重，每天只执行一次
+        _run_event_calendar_flow(d)
 
         # 再等待到开盘前启动时间
         _wait_for_market_start(MARKET_START_TIME)
@@ -3024,6 +3591,8 @@ def run_once():
 
 def main_loop():
     print("[monitor_tdx] started", flush=True)
+    # 启动时先连 Redis，取宿主机 IP 并写回 DB_HOST，后续所有 MySQL 查询都连宿主机
+    _init_db_host_from_redis()
     while True:
         try:
             run_once()
@@ -3042,14 +3611,19 @@ def _cli():
     # 手动触发：通过豆包抓取当天宏观市场数据（美债+原油+铜）→ 落文件 → 入库
     parser.add_argument("--macro-market-data", action="store_true",
                         help="通过豆包抓取当天宏观市场数据(美债/原油/铜)并入库")
+    # 手动触发：通过豆包抓取重要宏观事件日程 → 入库 → 读库 → 发微信（含临近提示）
+    parser.add_argument("--event-calendar", action="store_true",
+                        help="通过豆包抓取重要宏观事件日程(议息/CPI/PPI/非农)并入库发送微信")
     # 可选指定日期 YYYYMMDD（默认今天）
     parser.add_argument("--date", type=str, default=None,
-                        help="指定日期 YYYYMMDD，默认今天（仅 --macro-market-data 时生效）")
+                        help="指定日期 YYYYMMDD，默认今天（--macro-market-data / --event-calendar 时生效）")
     args = parser.parse_args()
     try:
         os.chdir(os.path.dirname(__file__))
     except Exception:
         pass
+    # 启动时先连 Redis，取宿主机 IP 并写回 DB_HOST，后续所有 MySQL 查询都连宿主机
+    _init_db_host_from_redis()
     if args.macro_market_data:
         d = args.date or datetime.now().strftime("%Y%m%d")
         print(f"[monitor_tdx] mode=macro-market-data, date={d}", flush=True)
@@ -3058,6 +3632,18 @@ def _cli():
             print(f"[monitor_tdx] [macro_market_data] result: {'OK' if ok else 'FAIL'}", flush=True)
             if ok:
                 _run_macro_oil_analysis_and_print()
+        except Exception as e:
+            import traceback
+            print(f"[monitor_tdx] error: {e}", flush=True)
+            traceback.print_exc()
+        return
+    if args.event_calendar:
+        d = args.date or datetime.now().strftime("%Y%m%d")
+        print(f"[monitor_tdx] mode=event-calendar, date={d}", flush=True)
+        try:
+            ok = _fetch_event_calendar_via_doubao(d)
+            print(f"[monitor_tdx] [event_calendar] fetch result: {'OK' if ok else 'FAIL'}", flush=True)
+            _send_event_calendar_to_wechat()
         except Exception as e:
             import traceback
             print(f"[monitor_tdx] error: {e}", flush=True)
